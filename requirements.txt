@@ -1,0 +1,5 @@
+# Republishing UxPlay's _airplay._tcp record on the real interface -- TXT
+# contents, keys and all -- is what this is here for, and zeroconf is the only
+# Python responder that gives that much control. Everything else the receiver
+# needs -- binary plists, asyncio sockets -- is standard library.
+zeroconf>=0.132

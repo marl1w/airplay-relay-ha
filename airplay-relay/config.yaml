@@ -1,0 +1,47 @@
+name: AirPlay Relay
+version: "0.1.0"
+slug: airplay_relay
+description: AirPlay a video from your phone and every screen in the house can watch it
+url: https://github.com/marl1w/airplay-relay-ha
+arch:
+  - amd64
+init: false
+startup: services
+boot: manual
+
+# Discovery is multicast and the receiver listens on 7000, so this needs the
+# host's own network rather than the add-on bridge.
+host_network: true
+
+# Not ingress: that routes through the add-on's address on the Supervisor
+# bridge, which an add-on using the host's network does not have. The status
+# page is reached directly instead, from the button on the add-on's page.
+# The port must be written as [PORT:nnnn]; a literal number fails Supervisor's
+# validation, and a config.yaml that fails validation makes the whole app vanish
+# from the store with "installed app has been removed from repository".
+# Ingress puts the page inside Home Assistant rather than opening a new tab.
+# ingress_port must be fixed for an app on the host's network, and it is the
+# same port the stream is served from.
+ingress: true
+ingress_port: 8099
+panel_icon: mdi:cast-connected
+panel_title: Relay
+
+webui: "http://[HOST]:[PORT:8099]/"
+
+# Ignored for publishing because the app uses the host's network, but the
+# [PORT:8099] above is substituted from here.
+ports:
+  8099/tcp: 8099
+ports_description:
+  8099/tcp: Stream, channel list and status page
+
+options:
+  name: Relay
+  channel_port: 8099
+  log_level: info
+
+schema:
+  name: str
+  channel_port: int(1024,65535)
+  log_level: list(debug|info)

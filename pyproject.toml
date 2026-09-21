@@ -1,0 +1,45 @@
+[tool.ruff]
+# Alpine 3.21 ships Python 3.12, so that is what the add-on actually runs, even
+# though a laptop running the same code will usually have something newer.
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = [
+  "E",    # pycodestyle
+  "F",    # pyflakes
+  "W",    # warnings
+  "I",    # isort
+  "UP",   # pyupgrade
+  "B",    # bugbear
+  "SIM",  # simplify
+  "RUF",  # ruff
+  "ASYNC",
+  "D",    # docstrings
+]
+ignore = [
+  "D203",  # incompatible with D211
+  "D213",  # incompatible with D212
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Tests document themselves through their names.
+"tests/*" = ["D100", "D101", "D102", "D103", "D107"]
+# The status page is user-facing text: en dashes and multiplication signs are
+# what the typography calls for, not accidents.
+"airplay-relay/airplay_relay/page.py" = ["RUF001", "E501"]
+# Listing a tmpfs directory of a few files costs microseconds; a thread for it
+# would be more machinery than the blocking call it avoids.
+"airplay-relay/airplay_relay/status.py" = ["ASYNC240"]
+
+[tool.ruff.lint.isort]
+force-sort-within-sections = true
+combine-as-imports = true
+known-first-party = ["airplay_relay", "tests"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "pep257"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["airplay-relay"]
