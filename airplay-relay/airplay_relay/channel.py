@@ -585,8 +585,7 @@ class Channel:
         """Move down the source's renditions when the link cannot keep up."""
         while True:
             await asyncio.sleep(SAMPLE_SECONDS)
-            ladder = self._ladder
-            if ladder is None or self._switching:
+            if self._switching:
                 continue
             if not self.playing:
                 self._pace.reset()
@@ -596,6 +595,11 @@ class Channel:
             clock = time.monotonic()
             self._pace.note(clock, status.published(self.directory))
             self._remember()
+
+            # Sampled before the ladder check, so single-rendition streams are measured too.
+            ladder = self._ladder
+            if ladder is None:
+                continue
 
             behind = self._pace.ratio(clock, BEHIND_SECONDS)
             if behind is not None and behind < BEHIND_RATIO and ladder.down(clock):
