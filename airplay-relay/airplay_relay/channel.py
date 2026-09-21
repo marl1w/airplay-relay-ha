@@ -106,6 +106,11 @@ class _Handler(SimpleHTTPRequestHandler):
         route = self.path.split("?")[0].rstrip("/") or "/"
         if route in ("/", "/index.html"):
             self._send(PAGE.encode(), "text/html; charset=utf-8")
+        elif route == f"/{CHANNEL_LIST}":
+            # The Host header is what the player typed, which is what its
+            # channel has to point at.
+            host = self.headers.get("Host", "")
+            self._send(self.channel.channel_list(host).encode(), "audio/x-mpegurl")
         elif route == "/status.json":
             self._send(json.dumps(self.channel.snapshot()).encode(), "application/json")
         elif route.endswith(".ts") or route.endswith(".m3u8"):
@@ -242,20 +247,25 @@ class Channel:
             return 0.0
         return max(0.0, time.monotonic() - self._started_at)
 
-    def _write_channel_list(self) -> None:
-        """Write the channel list, so a player is configured once and for good.
+    def channel_list(self, host: str = "") -> str:
+        """Return the channel list, pointing back at however it was asked for.
 
-        It is static and always present, whether or not anything is playing --
-        an IPTV app expects its channels to exist even when they are off air.
+        Built per request rather than written once, so that a player configured
+        with a name is given a stream URL with that name in it. Writing the
+        address into it meant a player could be pointed at relay.local, fetch
+        the list, and then play from a numeric address that the name existed to
+        avoid depending on.
+
+        It is always present, whether or not anything is playing -- an IPTV app
+        expects its channels to exist even when they are off air.
         """
-        host = self.address or "127.0.0.1"
-        (self.directory / CHANNEL_LIST).write_text(
+        where = host or f"{self.address or '127.0.0.1'}:{self.port}"
+        return (
             "#EXTM3U\n"
             f'#EXTINF:-1 tvg-id="relay" tvg-name="{self.name}"'
-            f' tvg-logo="http://{host}:{self.port}/{LOGO}"'
+            f' tvg-logo="http://{where}/{LOGO}"'
             f' group-title="Home",{self.name}\n'
-            f"http://{host}:{self.port}/{PLAYLIST}\n",
-            encoding="utf-8",
+            f"http://{where}/{PLAYLIST}\n"
         )
 
     def serve(self) -> None:
@@ -264,7 +274,6 @@ class Channel:
             self._loop = asyncio.get_running_loop()
         self.directory.mkdir(parents=True, exist_ok=True)
         draw_logo(self.directory / LOGO)
-        self._write_channel_list()
         # A subclass per channel, because the handler reads `self.channel` and
         # attributes set on a functools.partial never reach the instances it
         # builds -- which is why /status.json failed while plain files served.
@@ -953,7 +962,6 @@ class Channel:
         if removed:
             _LOGGER.info("cleared %d segments", removed)
         self.directory.mkdir(parents=True, exist_ok=True)
-        self._write_channel_list()
 
     def close(self) -> None:
         """Shut the HTTP server down."""
