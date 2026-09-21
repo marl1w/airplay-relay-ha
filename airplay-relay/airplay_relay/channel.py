@@ -77,9 +77,13 @@ IDLE_MINUTES = 15
 
 # Served explicitly because the mimetypes database disagrees with itself across
 # distributions, and a playlist sent as text/plain is refused by some players.
+# The channel list is application/x-mpegurl and not the older audio/x-mpegurl:
+# an IPTV app that sniffs the type sees audio/* and files a channel list as an
+# audio station, so the list arrives, parses, and the channel is nowhere -- which
+# looks exactly like the app never fetched it.
 mimetypes.add_type("application/vnd.apple.mpegurl", ".m3u8")
 mimetypes.add_type("video/mp2t", ".ts")
-mimetypes.add_type("audio/x-mpegurl", ".m3u")
+mimetypes.add_type("application/x-mpegurl", ".m3u")
 
 
 def _track_names(languages: list[tuple[str, str]]) -> tuple[str, ...]:
@@ -128,7 +132,7 @@ class _Handler(SimpleHTTPRequestHandler):
             # The Host header is what the player typed, which is what its
             # channel has to point at.
             host = self.headers.get("Host", "")
-            self._send(self.channel.channel_list(host).encode(), "audio/x-mpegurl")
+            self._send(self.channel.channel_list(host).encode(), "application/x-mpegurl")
         elif route == "/status.json":
             self._send(json.dumps(self.channel.snapshot()).encode(), "application/json")
         elif route.endswith(".ts") or route.endswith(".m3u8"):
