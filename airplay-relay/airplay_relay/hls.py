@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
+import contextlib
 import logging
 from urllib.parse import urljoin
 from urllib.request import Request, urlopen
@@ -52,6 +53,59 @@ def parse(playlist: str, base: str) -> list[tuple[str, float]]:
             segments.append((urljoin(base, text), duration))
             duration = 0.0
     return segments
+
+
+def _attributes(line: str, tag: str) -> dict[str, str]:
+    """Return one playlist tag's attributes, splitting on commas outside quotes."""
+    text = line.removeprefix(tag)
+    parts: list[str] = []
+    quoted = False
+    current = ""
+    for character in text:
+        if character == '"':
+            quoted = not quoted
+        if character == "," and not quoted:
+            parts.append(current)
+            current = ""
+            continue
+        current += character
+    parts.append(current)
+
+    found: dict[str, str] = {}
+    for part in parts:
+        key, separator, value = part.partition("=")
+        if separator:
+            found[key.strip()] = value.strip().strip('"')
+    return found
+
+
+def variants(playlist: str) -> list[tuple[int, str, str]]:
+    """Return (bandwidth, resolution, audio group) for each rendition, in playlist order."""
+    found: list[tuple[int, str, str]] = []
+    for line in playlist.splitlines():
+        if not line.startswith("#EXT-X-STREAM-INF:"):
+            continue
+        attributes = _attributes(line, "#EXT-X-STREAM-INF:")
+        bandwidth = 0
+        with contextlib.suppress(ValueError):
+            bandwidth = int(attributes.get("BANDWIDTH", "0"))
+        found.append(
+            (bandwidth, attributes.get("RESOLUTION") or "unknown", attributes.get("AUDIO", ""))
+        )
+    return found
+
+
+def audio_renditions(playlist: str, group: str) -> list[tuple[str, str]]:
+    """Return (language, name) for each rendition in one audio group, in playlist order."""
+    found: list[tuple[str, str]] = []
+    for line in playlist.splitlines():
+        if not line.startswith("#EXT-X-MEDIA:"):
+            continue
+        attributes = _attributes(line, "#EXT-X-MEDIA:")
+        if attributes.get("TYPE") != "AUDIO" or attributes.get("GROUP-ID") != group:
+            continue
+        found.append((attributes.get("LANGUAGE", ""), attributes.get("NAME", "")))
+    return found
 
 
 def target_duration(playlist: str, default: float = 4.0) -> float:

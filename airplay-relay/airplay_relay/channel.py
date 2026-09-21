@@ -15,9 +15,10 @@ import time
 from urllib.parse import urljoin
 from urllib.request import Request, urlopen
 
-from . import status
-from .hls import StrippingPuller, payload_offset
+from . import standby, status
+from .hls import StrippingPuller, audio_renditions, payload_offset, variants
 from .logo import draw as draw_logo
+from .pacing import BEHIND_RATIO, BEHIND_SECONDS, STEADY_RATIO, STEADY_SECONDS, Ladder, Pace
 from .page import PAGE
 from .republish import Republisher
 
@@ -30,6 +31,10 @@ LOGO = "logo.png"
 
 RETRY_DELAYS = (1, 2, 4, 8, 15, 30)
 
+WATCHING_SECONDS = 30
+
+SAMPLE_SECONDS = 5
+
 SETTLED_SECONDS = 60
 
 IDLE_MINUTES = 15
@@ -38,6 +43,17 @@ IDLE_MINUTES = 15
 mimetypes.add_type("application/vnd.apple.mpegurl", ".m3u8")
 mimetypes.add_type("video/mp2t", ".ts")
 mimetypes.add_type("audio/x-mpegurl", ".m3u")
+
+
+def _track_names(languages: list[tuple[str, str]]) -> tuple[str, ...]:
+    """Return the ffmpeg arguments that label each audio track."""
+    arguments: list[str] = []
+    for position, (language, name) in enumerate(languages):
+        if language:
+            arguments += [f"-metadata:s:a:{position}", f"language={language}"]
+        if name:
+            arguments += [f"-metadata:s:a:{position}", f"title={name}"]
+    return tuple(arguments)
 
 
 class _Handler(SimpleHTTPRequestHandler):
@@ -56,11 +72,12 @@ class _Handler(SimpleHTTPRequestHandler):
         elif route == "/status.json":
             self._send(json.dumps(self.channel.snapshot()).encode(), "application/json")
         elif route.endswith(".ts") or route.endswith(".m3u8"):
-            if not self.channel.requested:
+            # Leftovers are from an ended stream; serving them would pass it off as live.
+            if not self.channel.requested and not self.channel.standing_by:
                 self.channel.note_leftovers(route)
                 self.send_error(404, "nothing is playing")
                 return
-            self.channel.note_viewer()
+            self.channel.note_viewer(self.client_address[0] if self.client_address else "")
             super().do_GET()
         elif route == "/stop":
             self.channel.request_stop()
@@ -116,11 +133,20 @@ class Channel:
         self._is_hls = True
         self._loop: asyncio.AbstractEventLoop | None = None
         self._last_viewer: float = 0.0
+        self._viewers: dict[str, float] = {}
         self._next_segment = 0
         self._warned_leftovers = False
         self.sender: dict[str, str] = {}
         self._sender_seen: float = 0.0
         self._needs_stripping = False
+        self._variant: int | None = None
+        self._languages: list[tuple[str, str]] = []
+        self._ladder: Ladder | None = None
+        self._pace = Pace()
+        self._adapter: asyncio.Task[None] | None = None
+        self._switching = False
+        self._card: list[bytes] = []
+        self._idler: asyncio.Task[None] | None = None
 
     @property
     def requested(self) -> bool:
@@ -164,6 +190,8 @@ class Channel:
         self._server = ThreadingHTTPServer(("0.0.0.0", self.port), handler)
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
         self._thread.start()
+        if self._loop is not None:
+            self._idler = self._loop.create_task(self._stand_by())
         _LOGGER.info(
             "stream on :%d/%s -- give an IPTV player :%d/%s",
             self.port,
@@ -182,6 +210,7 @@ class Channel:
         self._details = {}
         self._supervisor = asyncio.create_task(self._supervise(url))
         self._describer = asyncio.create_task(self._describe())
+        self._adapter = asyncio.create_task(self._adapt())
 
     async def pause(self) -> None:
         """Stop pulling but remember what was playing, so it can resume."""
@@ -212,6 +241,11 @@ class Channel:
             return 0.0
         return time.monotonic() - self._sender_seen
 
+    @property
+    def standing_by(self) -> bool:
+        """Whether the channel is carrying the standby card."""
+        return bool(self._card) and not self.requested
+
     def note_leftovers(self, route: str) -> None:
         """Say once that a player asked for a window the channel has ended."""
         if self._warned_leftovers:
@@ -227,9 +261,20 @@ class Channel:
                 seconds,
             )
 
-    def note_viewer(self) -> None:
+    def note_viewer(self, peer: str = "") -> None:
         """Record that someone fetched part of the stream just now."""
         self._last_viewer = time.monotonic()
+        if peer:
+            self._viewers[peer] = self._last_viewer
+
+    @property
+    def viewers(self) -> int:
+        """How many players have asked for anything lately."""
+        cutoff = time.monotonic() - WATCHING_SECONDS
+        for peer, seen in list(self._viewers.items()):
+            if seen < cutoff:
+                self._viewers.pop(peer, None)
+        return len(self._viewers)
 
     @property
     def seconds_since_viewer(self) -> float:
@@ -255,8 +300,12 @@ class Channel:
         """Stop the running stream without deciding what that means."""
         supervisor, self._supervisor = self._supervisor, None
         describer, self._describer = self._describer, None
-        if describer is not None:
-            describer.cancel()
+        adapter, self._adapter = self._adapter, None
+        for task in (describer, adapter):
+            if task is not None:
+                task.cancel()
+        self._switching = False
+        self._pace = Pace()
         self._started_at = None
         self._details = {}
         if supervisor is not None:
@@ -286,8 +335,28 @@ class Channel:
                 )
                 for line in body.splitlines()[:10]:
                     _LOGGER.info("  | %s", line[:160])
-                if "#EXT-X-STREAM-INF" in body:
-                    _LOGGER.info("this is a master playlist -- ffmpeg chooses a variant from it")
+                self._variant = None
+                self._languages = []
+                self._ladder = None
+                if offered := variants(body):
+                    self._ladder = Ladder(offered)
+                    self._variant = self._ladder.variant
+                    _LOGGER.info(
+                        "master playlist offers %s; taking %s",
+                        ", ".join(f"{name} at {rate // 1000}kbps" for rate, name, _ in offered),
+                        offered[self._variant][1],
+                    )
+                    if group := offered[self._variant][2]:
+                        self._languages = audio_renditions(body, group)
+                    if self._languages:
+                        _LOGGER.info(
+                            "audio: %s",
+                            ", ".join(
+                                name or language or "unnamed" for language, name in self._languages
+                            ),
+                        )
+                    self._needs_stripping = False
+                    return
             segment = next(
                 (
                     line.strip()
@@ -313,6 +382,9 @@ class Channel:
                 )
                 if head[:1] == b"\x47":
                     _LOGGER.info("the segment is MPEG-TS, which is what we want")
+                    return
+                if sample.lstrip()[:7] == b"#EXTM3U":
+                    _LOGGER.info("the playlist points at other playlists; ffmpeg follows them")
                     return
 
                 offset = payload_offset(sample)
@@ -345,6 +417,7 @@ class Channel:
             "paused": self._paused_url is not None,
             "last_error": None if playing else self._last_error,
             "seconds_since_viewer": round(self.seconds_since_viewer),
+            "viewers": self.viewers,
             "sender": self.sender,
             "sender_seen": round(self.seconds_since_sender),
             "position": round(self.position, 1),
@@ -354,6 +427,13 @@ class Channel:
             "window_seconds": round(seconds, 1),
             "window_bytes": size,
             "bitrate_kbps": bitrate,
+            "standby": self.standing_by,
+            "rendition": self._ladder.name if self._ladder and self.requested else None,
+            "rendition_kbps": (
+                self._ladder.bandwidth // 1000 if self._ladder and self.requested else None
+            ),
+            "rendition_rung": self._ladder.rung + 1 if self._ladder and self.requested else None,
+            "renditions": len(self._ladder.offered) if self._ladder and self.requested else None,
             "stream_url": f"http://{self.address}:{self.port}/{PLAYLIST}",
             "playlist_url": f"http://{self.address}:{self.port}/{CHANNEL_LIST}",
             **self._details,
@@ -363,8 +443,11 @@ class Channel:
         """Read codecs and resolution once a few segments exist."""
         for _ in range(20):
             await asyncio.sleep(3)
-            if not self.playing:
+            # `requested`, not `playing`: a slow first segment must not end the description.
+            if not self.requested:
                 return
+            if not self.playing:
+                continue
             if details := await status.probe(self.directory):
                 self._details = details
                 _LOGGER.info(
@@ -375,6 +458,75 @@ class Channel:
                     details.get("audio_codec"),
                 )
                 return
+
+    async def _stand_by(self) -> None:
+        """Publish the standby card whenever nothing else is on the channel."""
+        self._card = await standby.render(self.directory)
+        if not self._card:
+            return
+        frame = 0
+        republisher: Republisher | None = None
+        while True:
+            if self.requested:
+                republisher = None
+                await asyncio.sleep(1)
+                continue
+            if republisher is None:
+                republisher = Republisher(
+                    self.directory, PLAYLIST, self.hls_list_size, start=self._numbering_starts_at()
+                )
+            republisher.add(self._card[frame % len(self._card)], standby.SECONDS)
+            frame += 1
+            await asyncio.sleep(standby.SECONDS)
+
+    async def _adapt(self) -> None:
+        """Move down the source's renditions when the link cannot keep up."""
+        while True:
+            await asyncio.sleep(SAMPLE_SECONDS)
+            ladder = self._ladder
+            if ladder is None or self._switching:
+                continue
+            if not self.playing:
+                self._pace.reset()
+                continue
+
+            clock = asyncio.get_running_loop().time()
+            self._pace.note(clock, status.published(self.directory))
+
+            behind = self._pace.ratio(clock, BEHIND_SECONDS)
+            if behind is not None and behind < BEHIND_RATIO and ladder.down(clock):
+                await self._change_rendition(
+                    f"published {behind:.0%} of real time over the last "
+                    f"{BEHIND_SECONDS:.0f}s, which the link cannot sustain"
+                )
+                continue
+
+            settled = self._pace.ratio(clock, STEADY_SECONDS)
+            if settled is not None and settled >= STEADY_RATIO and ladder.up(clock):
+                await self._change_rendition(
+                    f"kept up for {STEADY_SECONDS / 60:.0f} minutes, so there is room for more"
+                )
+
+    async def _change_rendition(self, because: str) -> None:
+        """Restart the pull on the rendition the ladder now points at."""
+        ladder = self._ladder
+        if ladder is None:
+            return
+        _LOGGER.warning(
+            "moving to the %s rendition (%dkbps): %s",
+            ladder.name,
+            ladder.bandwidth // 1000,
+            because,
+        )
+        self._variant = ladder.variant
+        self._pace.reset()
+        self._details = {}
+        describer, self._describer = self._describer, None
+        if describer is not None:
+            describer.cancel()
+        self._describer = asyncio.create_task(self._describe())
+        self._switching = True
+        await self._kill()
 
     async def _supervise(self, url: str) -> None:
         """Keep the stream running until this task is cancelled."""
@@ -399,6 +551,12 @@ class Channel:
                 self.source_url = None
                 self._clear()
                 return
+
+            if self._switching:
+                self._switching = False
+                self._last_error = None
+                attempt = 0
+                continue
 
             attempt = 1 if ran_for >= SETTLED_SECONDS else attempt + 1
             delay = RETRY_DELAYS[min(attempt - 1, len(RETRY_DELAYS) - 1)]
@@ -456,6 +614,13 @@ class Channel:
             # No -re: a live HLS source already arrives at playback speed.
             "-i",
             url,
+            # Every audio track; no subtitles, as MPEG-TS cannot carry HLS WebVTT.
+            *(
+                ("-map", f"0:p:{self._variant}:v:0", "-map", f"0:p:{self._variant}:a")
+                if self._variant is not None
+                else ("-map", "0:v:0", "-map", "0:a?")
+            ),
+            *_track_names(self._languages),
             "-c",
             "copy",
             "-f",
@@ -546,6 +711,9 @@ class Channel:
 
     def close(self) -> None:
         """Shut the HTTP server down."""
+        idler, self._idler = self._idler, None
+        if idler is not None:
+            idler.cancel()
         if self._server is not None:
             self._server.shutdown()
             self._server.server_close()

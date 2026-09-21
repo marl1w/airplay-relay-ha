@@ -43,6 +43,45 @@ pointing at the proxy. That keeps one receiver visible instead of two, and it
 gets withdrawn properly on shutdown rather than lingering as a ghost that the
 next run collides with.
 
+## Tuning in before anything is playing
+
+The channel always carries something. Between streams it publishes a still
+card, on the same playlist and the same numbering the next stream carries on
+from, so a television can be pointed at the channel and left there: when the
+phone starts a stream the card gives way to it as an ordinary discontinuity,
+with nothing to reconnect.
+
+The card is rendered once at startup -- a logo on a dark background, five frames
+a second, about 60 kB in all -- and looped, so it costs nothing to keep up.
+
+## Choosing a rendition
+
+Where the source offers the same programme at several bitrates, the best is
+taken and kept for as long as the link carries it. If the window stops gaining
+a second of media per second of real time for the best part of a minute, a step
+down the ladder keeps the picture moving rather than letting every screen
+stutter at once; five settled minutes earn a step back, and the rendition just
+left is barred for ten, because oscillating costs more than staying a step low.
+
+The status page names the rendition in use and how far down the ladder it is.
+
+## Several languages
+
+When the source offers its audio in more than one language, every track is
+relayed and the player picks between them -- nothing on the status page
+switches it, because the choice belongs in the same menu a viewer already uses
+for subtitles. The add-on log names the tracks as it finds them:
+
+    audio: English, 日本語, Deutsch, Español, International Feed
+
+Only the video is pinned to one rendition: the highest the source offers, which
+is what would have been taken anyway. The alternate audio costs about 160 kbps
+each, so five languages are a rounding error against a 9 Mbps picture.
+
+Whether the player shows those names or just "Track 1, Track 2" depends on
+ffmpeg: it carries the languages as far as the transport stream, whose muxer
+does not always write them all back out.
+
 ## Configuration
 
 | Option | What it does |

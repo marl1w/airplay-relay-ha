@@ -27,6 +27,8 @@ ignore = [
 "airplay-relay/airplay_relay/page.py" = ["RUF001", "E501"]
 # Listing a small tmpfs directory blocks for microseconds.
 "airplay-relay/airplay_relay/status.py" = ["ASYNC240"]
+# Reads three small segments once, at startup.
+"airplay-relay/airplay_relay/standby.py" = ["ASYNC240"]
 
 [tool.ruff.lint.isort]
 force-sort-within-sections = true
