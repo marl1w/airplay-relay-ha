@@ -94,6 +94,20 @@ class _Handler(SimpleHTTPRequestHandler):
 
     channel: Channel
 
+    # HTTP/1.1, so a player keeps one connection and fetches every segment down
+    # it. Under 1.0 -- which is what BaseHTTPRequestHandler speaks unless told
+    # otherwise -- each segment costs a new connection, and a client that
+    # reached this receiver by name pays for resolving that name again every
+    # two seconds. On a network where a .local lookup crosses a VLAN and takes
+    # seconds, that alone is enough to keep a television buffering forever
+    # while the same stream plays perfectly from the address.
+    protocol_version = "HTTP/1.1"
+
+    # A kept connection must not be kept for ever: a television switched off
+    # mid-stream would otherwise hold its thread until the add-on restarts.
+    # Comfortably longer than the gap between segment requests.
+    timeout = 30
+
     def log_message(self, format: str, *args) -> None:
         """Keep segment and status-page requests out of the add-on log.
 
