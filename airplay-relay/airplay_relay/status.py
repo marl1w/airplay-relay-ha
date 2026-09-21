@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 from pathlib import Path
+import socket
 from typing import Any
 from urllib.parse import urlparse
 
@@ -32,6 +33,16 @@ def window(directory: Path) -> tuple[int, float, int]:
     total = sum(segment.stat().st_size for segment in segments if segment.exists())
     seconds = _playlist_duration(directory)
     return len(segments), seconds, total
+
+
+def dns_name(address: str) -> str:
+    """Return the name this address is registered under, or nothing."""
+    try:
+        name, _, _ = socket.gethostbyaddr(address)
+    except OSError:
+        return ""
+    # A bare address back means nothing is registered.
+    return "" if name == address else name
 
 
 def published(directory: Path) -> list[tuple[str, float]]:

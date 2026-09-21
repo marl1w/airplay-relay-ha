@@ -127,6 +127,7 @@ class Channel:
         self.user_agent = user_agent
         self.name = name
         self.hostname = hostname
+        self.dns_name = status.dns_name(address) if address else ""
         self.address = address
         self.port = port
         self.hls_time = hls_time
@@ -175,6 +176,14 @@ class Channel:
         if self._started_at is None:
             return 0.0
         return max(0.0, time.monotonic() - self._started_at)
+
+    def _by_name(self, path: str) -> str | None:
+        """Return a URL using whichever name is likeliest to resolve quickly."""
+        if self.dns_name:
+            return f"http://{self.dns_name}:{self.port}/{path}"
+        if self.hostname:
+            return f"http://{self.hostname}.local:{self.port}/{path}"
+        return None
 
     def channel_list(self, host: str = "") -> str:
         """Return the channel list, pointing back at however it was asked for."""
@@ -449,14 +458,9 @@ class Channel:
             "renditions": len(self._ladder.offered) if self._ladder and self.requested else None,
             "stream_url": f"http://{self.address}:{self.port}/{PLAYLIST}",
             "playlist_url": f"http://{self.address}:{self.port}/{CHANNEL_LIST}",
-            "stream_name_url": (
-                f"http://{self.hostname}.local:{self.port}/{PLAYLIST}" if self.hostname else None
-            ),
-            "playlist_name_url": (
-                f"http://{self.hostname}.local:{self.port}/{CHANNEL_LIST}"
-                if self.hostname
-                else None
-            ),
+            "stream_name_url": self._by_name(PLAYLIST),
+            "playlist_name_url": self._by_name(CHANNEL_LIST),
+            "name_is_mdns": not self.dns_name,
             **self._details,
         }
 
