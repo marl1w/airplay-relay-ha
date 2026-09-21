@@ -23,6 +23,16 @@ def addon_options() -> dict[str, str]:
     return {key: str(value) for key, value in raw.items() if value not in (None, "")}
 
 
+def hostname_for(name: str) -> str:
+    """Turn what the receiver is called into a lowercase ASCII label DNS will carry."""
+    cleaned = "".join(
+        character if character.isascii() and character.isalnum() else "-"
+        for character in name.lower()
+    )
+    trimmed = "-".join(part for part in cleaned.split("-") if part)
+    return trimmed[:63] or "relay"
+
+
 def default_address() -> str:
     """Return the local address that reaches the default route."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -56,7 +66,7 @@ class Config:
         self.hls_time = int(self._setting("hls_time", "2"))
         self.hls_list_size = int(self._setting("hls_list_size", "6"))
 
-        self.avahi_hostname = self._setting("avahi_hostname", "relay")
+        self.avahi_hostname = self._setting("avahi_hostname", "") or hostname_for(self.name)
         self.uxplay_hls = self._setting("hls", "true").lower() == "true"
         self.uxplay_debug = self._setting("uxplay_debug", "true").lower() == "true"
         self.uxplay_extra_args = self._setting("uxplay_extra_args", "")

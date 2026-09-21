@@ -110,12 +110,14 @@ class Channel:
         hls_list_size: int,
         user_agent: str = "",
         name: str = "Relay",
+        hostname: str = "",
         address: str = "",
     ) -> None:
         """Prepare the segment directory and the server that will offer it."""
         self.directory = Path(directory)
         self.user_agent = user_agent
         self.name = name
+        self.hostname = hostname
         self.address = address
         self.port = port
         self.hls_time = hls_time
@@ -202,8 +204,12 @@ class Channel:
 
     async def play(self, url: str) -> None:
         """Replace whatever is playing with the stream at this URL."""
-        await self.stop()
-        self._clear()
+        covered = self.standing_by
+        self._paused_url = None
+        self.source_url = None
+        await self._halt()
+        if not covered:
+            self._clear()
         self.source_url = url
         self._last_error = None
         self._started_at = time.monotonic()
@@ -436,6 +442,14 @@ class Channel:
             "renditions": len(self._ladder.offered) if self._ladder and self.requested else None,
             "stream_url": f"http://{self.address}:{self.port}/{PLAYLIST}",
             "playlist_url": f"http://{self.address}:{self.port}/{CHANNEL_LIST}",
+            "stream_name_url": (
+                f"http://{self.hostname}.local:{self.port}/{PLAYLIST}" if self.hostname else None
+            ),
+            "playlist_name_url": (
+                f"http://{self.hostname}.local:{self.port}/{CHANNEL_LIST}"
+                if self.hostname
+                else None
+            ),
             **self._details,
         }
 
@@ -469,7 +483,7 @@ class Channel:
         while True:
             if self.requested:
                 republisher = None
-                await asyncio.sleep(1)
+                await asyncio.sleep(0.5)
                 continue
             if republisher is None:
                 republisher = Republisher(
