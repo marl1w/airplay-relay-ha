@@ -12,10 +12,11 @@ import mimetypes
 from pathlib import Path
 import threading
 import time
-from urllib.parse import urljoin
+from urllib.parse import parse_qs, urljoin, urlparse
 from urllib.request import Request, urlopen
 
 from . import standby, status
+from .history import History
 from .hls import StrippingPuller, audio_renditions, payload_offset, variants
 from .logo import draw as draw_logo
 from .pacing import BEHIND_RATIO, BEHIND_SECONDS, STEADY_RATIO, STEADY_SECONDS, Ladder, Pace
@@ -32,6 +33,8 @@ LOGO = "logo.png"
 RETRY_DELAYS = (1, 2, 4, 8, 15, 30)
 
 WATCHING_SECONDS = 30
+
+VERDICT_SECONDS = 20.0
 
 SAMPLE_SECONDS = 5
 
@@ -88,6 +91,16 @@ class _Handler(SimpleHTTPRequestHandler):
                 return
             self.channel.note_viewer(self.client_address[0] if self.client_address else "")
             super().do_GET()
+        elif route == "/history.json":
+            sessions = self.channel.history.recent() if self.channel.history else []
+            self._send(json.dumps(sessions).encode(), "application/json")
+        elif route == "/replay":
+            # By record id, not URL, so nothing on the network can name a source to fetch.
+            wanted = parse_qs(urlparse(self.path).query).get("id", [""])[0]
+            self._send(
+                json.dumps({"playing": self.channel.replay(wanted)}).encode(),
+                "application/json",
+            )
         elif route == "/stop":
             self.channel.request_stop()
             self._send(b'{"stopping": true}', "application/json")
@@ -120,6 +133,7 @@ class Channel:
         user_agent: str = "",
         name: str = "Relay",
         hostname: str = "",
+        history: History | None = None,
         address: str = "",
     ) -> None:
         """Prepare the segment directory and the server that will offer it."""
@@ -128,6 +142,8 @@ class Channel:
         self.name = name
         self.hostname = hostname
         self.dns_name = status.dns_name(address) if address else ""
+        self.history = history
+        self._session: dict | None = None
         self.address = address
         self.port = port
         self.hls_time = hls_time
@@ -230,6 +246,13 @@ class Channel:
         self._last_error = None
         self._started_at = time.monotonic()
         self._details = {}
+        if self.history is not None:
+            self._session = self.history.start(
+                source_url=url,
+                source_host=status.source_host(url),
+                sender=dict(self.sender),
+                name=self.name,
+            )
         self._supervisor = asyncio.create_task(self._supervise(url))
         self._describer = asyncio.create_task(self._describe())
         self._adapter = asyncio.create_task(self._adapt())
@@ -263,10 +286,42 @@ class Channel:
             return 0.0
         return time.monotonic() - self._sender_seen
 
+    def quality(self) -> dict[str, object]:
+        """Say in a word how the stream is going, and why."""
+        if not self.playing:
+            return {"state": "idle", "because": "nothing is playing"}
+        keeping = self._pace.ratio(time.monotonic(), VERDICT_SECONDS)
+        stepped = self._ladder.rung if self._ladder else 0
+        if keeping is None:
+            return {"state": "starting", "because": "not enough of the stream has arrived to judge"}
+        if keeping < BEHIND_RATIO:
+            return {
+                "state": "poor",
+                "because": f"the window is gaining {keeping:.0%} of real time; the link is behind",
+                "keeping_up": round(keeping, 3),
+            }
+        if stepped:
+            return {
+                "state": "fair",
+                "because": f"steady, but {stepped} rendition(s) below the best the source offers",
+                "keeping_up": round(keeping, 3),
+            }
+        return {
+            "state": "good",
+            "because": "keeping up with the source at its best rendition",
+            "keeping_up": round(keeping, 3),
+        }
+
     @property
     def standing_by(self) -> bool:
         """Whether the channel is carrying the standby card."""
         return bool(self._card) and not self.requested
+
+    def _finish(self, reason: str) -> None:
+        """Close the record of the stream that has just ended."""
+        if self.history is not None:
+            self.history.finish(self._session, reason)
+        self._session = None
 
     def note_leftovers(self, route: str) -> None:
         """Say once that a player asked for a window the channel has ended."""
@@ -305,14 +360,32 @@ class Channel:
             return 0.0
         return time.monotonic() - self._last_viewer
 
+    def replay(self, identifier: str) -> bool:
+        """Start a stream from the record again, if its source is still named."""
+        if self.history is None:
+            return False
+        session = self.history.find(identifier)
+        url = session.get("source_url") if session else None
+        if not url:
+            return False
+        _LOGGER.info("playing again from the record: %s", url)
+        loop = self._loop
+        if loop is None:
+            return False
+        loop.call_soon_threadsafe(lambda: asyncio.create_task(self.play(url)))
+        return True
+
     def request_stop(self) -> None:
         """Ask for the stream to end, from a thread that is not the loop's."""
         loop = self._loop
         if loop is not None:
             loop.call_soon_threadsafe(lambda: asyncio.create_task(self.stop()))
 
-    async def stop(self) -> None:
+    async def stop(self, reason: str = "stopped") -> None:
         """Stop pulling and stop retrying, recording why."""
+        if self.history is not None:
+            self.history.finish(self._session, reason)
+        self._session = None
         self._paused_url = None
         self.source_url = None
         await self._halt()
@@ -450,6 +523,10 @@ class Channel:
             "window_bytes": size,
             "bitrate_kbps": bitrate,
             "standby": self.standing_by,
+            "quality": self.quality(),
+            "session_id": self._session["id"] if self._session else None,
+            "session_started": self._session["started"] if self._session else None,
+            "samples": self._session["samples"][-240:] if self._session else [],
             "rendition": self._ladder.name if self._ladder and self.requested else None,
             "rendition_kbps": (
                 self._ladder.bandwidth // 1000 if self._ladder and self.requested else None
@@ -515,8 +592,10 @@ class Channel:
                 self._pace.reset()
                 continue
 
-            clock = asyncio.get_running_loop().time()
+            # time.monotonic, not the loop clock: the page reads the same pace from a thread.
+            clock = time.monotonic()
             self._pace.note(clock, status.published(self.directory))
+            self._remember()
 
             behind = self._pace.ratio(clock, BEHIND_SECONDS)
             if behind is not None and behind < BEHIND_RATIO and ladder.down(clock):
@@ -531,6 +610,33 @@ class Channel:
                 await self._change_rendition(
                     f"kept up for {STEADY_SECONDS / 60:.0f} minutes, so there is room for more"
                 )
+
+    def _remember(self) -> None:
+        """Add the stream's current shape to its own record."""
+        if self.history is None or self._session is None:
+            return
+        _, seconds, size = status.window(self.directory)
+        verdict = self.quality()
+        self.history.sample(
+            self._session,
+            {
+                "viewers": self.viewers,
+                "kbps": round(size * 8 / seconds / 1000) if seconds > 0 else None,
+                "rung": (self._ladder.rung + 1) if self._ladder else None,
+                "state": verdict["state"],
+            },
+        )
+        self.history.describe(
+            self._session,
+            width=self._details.get("width"),
+            height=self._details.get("height"),
+            video_codec=self._details.get("video_codec"),
+            audio_codec=self._details.get("audio_codec"),
+            audio_tracks=self._details.get("audio_tracks"),
+            rendition=self._ladder.name if self._ladder else None,
+            renditions=len(self._ladder.offered) if self._ladder else None,
+            sender=dict(self.sender) or None,
+        )
 
     async def _change_rendition(self, because: str) -> None:
         """Restart the pull on the rendition the ladder now points at."""
@@ -568,12 +674,14 @@ class Channel:
             if code == 0 and not self._is_hls:
                 _LOGGER.info("the source finished after %.0fs", ran_for)
                 self.source_url = None
+                self._finish("finished")
                 self._clear()
                 return
 
             if self.seconds_since_viewer > IDLE_MINUTES * 60:
                 _LOGGER.info("nobody has watched for %d minutes; stopping", IDLE_MINUTES)
                 self.source_url = None
+                self._finish("nobody watching")
                 self._clear()
                 return
 

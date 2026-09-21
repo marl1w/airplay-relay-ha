@@ -55,6 +55,7 @@ class Config:
         self.port = int(self._setting("port", "7000"))
         self.address = self._setting("advertise_ip", "") or default_address()
 
+        self.state_dir = self._setting("state_dir", "/data")
         self.channel_port = int(self._setting("channel_port", "8099"))
         # In RAM, so continuous segment writes do not churn the persistent volume.
         self.channel_dir = self._setting("channel_dir", "/dev/shm/airplay-relay")

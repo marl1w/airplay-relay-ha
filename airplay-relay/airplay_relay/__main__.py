@@ -11,6 +11,7 @@ import signal
 
 from .channel import Channel
 from .config import Config
+from .history import open_in
 from .mirror import Mirror, read_upstream
 from .proxy import Message, Proxy, plist_response
 from .uxplay import build_command, run as run_uxplay
@@ -36,6 +37,7 @@ def _stop_event() -> asyncio.Event:
 
 async def run_channel(config: Config, url: str | None) -> None:
     """Republish whatever the sender hands over, or one URL given on the command line."""
+    history = open_in(config.state_dir, config.channel_dir)
     channel = Channel(
         directory=config.channel_dir,
         port=config.channel_port,
@@ -45,6 +47,7 @@ async def run_channel(config: Config, url: str | None) -> None:
         name=config.name,
         hostname=config.avahi_hostname,
         address=config.address,
+        history=history,
     )
     channel.serve()
     stop = _stop_event()
@@ -54,9 +57,16 @@ async def run_channel(config: Config, url: str | None) -> None:
             await channel.play(url)
             await stop.wait()
         finally:
-            await channel.stop()
+            await channel.stop("interrupted")
             channel.close()
         return
+
+    if resuming := history.unfinished():
+        _LOGGER.warning(
+            "the last stream was still playing when the add-on stopped; starting it again: %s",
+            resuming["source_url"],
+        )
+        await channel.play(resuming["source_url"])
 
     # A replaced session must not control the stream that superseded it.
     current_session: dict[str, str | None] = {"id": None}
@@ -205,7 +215,8 @@ async def run_channel(config: Config, url: str | None) -> None:
     finally:
         for task in (uxplay, waiter):
             task.cancel()
-        await channel.stop()
+        # "interrupted" marks the stream to be resumed when the add-on starts again.
+        await channel.stop("interrupted")
         channel.close()
 
 
