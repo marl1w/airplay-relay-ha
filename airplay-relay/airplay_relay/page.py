@@ -241,10 +241,12 @@ async function refresh() {
   // only reaches players that speak mDNS -- so it is offered, not substituted.
   const byName = $("byName");
   if (data.playlist_name_url) {
-    byName.textContent =
-      `${data.playlist_name_url} works too, but only on the same network segment: `
-      + "a .local lookup that has to cross a VLAN can take seconds, and a player "
-      + "that pays that for every connection buffers on a stream the address serves fine.";
+    byName.textContent = data.name_is_mdns
+      ? `${data.playlist_name_url} works too, but only for players on this network `
+        + "segment: a .local lookup that crosses a VLAN can take seconds, and a player "
+        + "paying that on every connection buffers on a stream the address serves fine."
+      : `${data.playlist_name_url} works too, and is the better thing to type: `
+        + "it is the name your router already answers for, so it survives the address changing.";
     byName.hidden = false;
   } else {
     byName.hidden = true;

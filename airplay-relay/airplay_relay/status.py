@@ -13,6 +13,7 @@ import asyncio
 import json
 import logging
 from pathlib import Path
+import socket
 from typing import Any
 from urllib.parse import urlparse
 
@@ -41,6 +42,23 @@ def window(directory: Path) -> tuple[int, float, int]:
     total = sum(segment.stat().st_size for segment in segments if segment.exists())
     seconds = _playlist_duration(directory)
     return len(segments), seconds, total
+
+
+def dns_name(address: str) -> str:
+    """Return the name this address is registered under, or nothing.
+
+    A home router registers each DHCP lease in its own zone -- the box the
+    add-on runs on is homeassistant.lan because that is the hostname it asked
+    for -- and a reverse lookup is how to find that name from inside, without
+    being told it. It is worth the trouble because it is the name a television
+    resolves quickly, where the mDNS one can take seconds to answer.
+    """
+    try:
+        name, _, _ = socket.gethostbyaddr(address)
+    except OSError:
+        return ""
+    # A bare address back means nothing was registered.
+    return "" if name == address else name
 
 
 def published(directory: Path) -> list[tuple[str, float]]:

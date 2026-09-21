@@ -181,6 +181,9 @@ class Channel:
         self.user_agent = user_agent
         self.name = name
         self.hostname = hostname
+        # What the router calls this address, found once at startup. Empty when
+        # nothing answers, which is ordinary on a network with no local zone.
+        self.dns_name = status.dns_name(address) if address else ""
         self.address = address
         self.port = port
         self.hls_time = hls_time
@@ -260,6 +263,14 @@ class Channel:
         if self._started_at is None:
             return 0.0
         return max(0.0, time.monotonic() - self._started_at)
+
+    def _by_name(self, path: str) -> str | None:
+        """Return a URL using whichever name is likeliest to resolve quickly."""
+        if self.dns_name:
+            return f"http://{self.dns_name}:{self.port}/{path}"
+        if self.hostname:
+            return f"http://{self.hostname}.local:{self.port}/{path}"
+        return None
 
     def channel_list(self, host: str = "") -> str:
         """Return the channel list, pointing back at however it was asked for.
@@ -600,17 +611,12 @@ class Channel:
             "renditions": len(self._ladder.offered) if self._ladder and self.requested else None,
             "stream_url": f"http://{self.address}:{self.port}/{PLAYLIST}",
             "playlist_url": f"http://{self.address}:{self.port}/{CHANNEL_LIST}",
-            # The same two by name. Whether a television resolves it depends on
-            # whether it speaks mDNS, so the address stays alongside rather
-            # than being replaced by it.
-            "stream_name_url": (
-                f"http://{self.hostname}.local:{self.port}/{PLAYLIST}" if self.hostname else None
-            ),
-            "playlist_name_url": (
-                f"http://{self.hostname}.local:{self.port}/{CHANNEL_LIST}"
-                if self.hostname
-                else None
-            ),
+            # The same two by name: the one the router registered if there is
+            # one, and the mDNS name otherwise. The address stays alongside,
+            # because whether a television resolves either is its own affair.
+            "stream_name_url": self._by_name(PLAYLIST),
+            "playlist_name_url": self._by_name(CHANNEL_LIST),
+            "name_is_mdns": not self.dns_name,
             **self._details,
         }
 
