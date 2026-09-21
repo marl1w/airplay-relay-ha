@@ -69,6 +69,9 @@ class _Handler(SimpleHTTPRequestHandler):
         route = self.path.split("?")[0].rstrip("/") or "/"
         if route in ("/", "/index.html"):
             self._send(PAGE.encode(), "text/html; charset=utf-8")
+        elif route == f"/{CHANNEL_LIST}":
+            host = self.headers.get("Host", "")
+            self._send(self.channel.channel_list(host).encode(), "audio/x-mpegurl")
         elif route == "/status.json":
             self._send(json.dumps(self.channel.snapshot()).encode(), "application/json")
         elif route.endswith(".ts") or route.endswith(".m3u8"):
@@ -167,16 +170,15 @@ class Channel:
             return 0.0
         return max(0.0, time.monotonic() - self._started_at)
 
-    def _write_channel_list(self) -> None:
-        """Write the channel list for IPTV players."""
-        host = self.address or "127.0.0.1"
-        (self.directory / CHANNEL_LIST).write_text(
+    def channel_list(self, host: str = "") -> str:
+        """Return the channel list, pointing back at however it was asked for."""
+        where = host or f"{self.address or '127.0.0.1'}:{self.port}"
+        return (
             "#EXTM3U\n"
             f'#EXTINF:-1 tvg-id="relay" tvg-name="{self.name}"'
-            f' tvg-logo="http://{host}:{self.port}/{LOGO}"'
+            f' tvg-logo="http://{where}/{LOGO}"'
             f' group-title="Home",{self.name}\n'
-            f"http://{host}:{self.port}/{PLAYLIST}\n",
-            encoding="utf-8",
+            f"http://{where}/{PLAYLIST}\n"
         )
 
     def serve(self) -> None:
@@ -185,7 +187,6 @@ class Channel:
             self._loop = asyncio.get_running_loop()
         self.directory.mkdir(parents=True, exist_ok=True)
         draw_logo(self.directory / LOGO)
-        self._write_channel_list()
         # A subclass, not a partial keyword: the handler reads `channel` from its class.
         bound = type("BoundHandler", (_Handler,), {"channel": self})
         handler = partial(bound, directory=str(self.directory))
@@ -721,7 +722,6 @@ class Channel:
         if removed:
             _LOGGER.info("cleared %d segments", removed)
         self.directory.mkdir(parents=True, exist_ok=True)
-        self._write_channel_list()
 
     def close(self) -> None:
         """Shut the HTTP server down."""
