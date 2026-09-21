@@ -45,7 +45,7 @@ IDLE_MINUTES = 15
 # Explicit: system mimetypes vary, and IPTV apps file audio/x-mpegurl lists as radio.
 mimetypes.add_type("application/vnd.apple.mpegurl", ".m3u8")
 mimetypes.add_type("video/mp2t", ".ts")
-mimetypes.add_type("audio/x-mpegurl", ".m3u")
+mimetypes.add_type("application/x-mpegurl", ".m3u")
 
 
 def _track_names(languages: list[tuple[str, str]]) -> tuple[str, ...]:
@@ -80,7 +80,7 @@ class _Handler(SimpleHTTPRequestHandler):
             self._send(PAGE.encode(), "text/html; charset=utf-8")
         elif route == f"/{CHANNEL_LIST}":
             host = self.headers.get("Host", "")
-            self._send(self.channel.channel_list(host).encode(), "audio/x-mpegurl")
+            self._send(self.channel.channel_list(host).encode(), "application/x-mpegurl")
         elif route == "/status.json":
             self._send(json.dumps(self.channel.snapshot()).encode(), "application/json")
         elif route.endswith(".ts") or route.endswith(".m3u8"):
