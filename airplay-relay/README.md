@@ -43,6 +43,22 @@ pointing at the proxy. That keeps one receiver visible instead of two, and it
 gets withdrawn properly on shutdown rather than lingering as a ghost that the
 next run collides with.
 
+## Pointing a player at it
+
+    http://<home-assistant>:8099/channels.m3u
+
+is the channel list, and what an IPTV app wants. The list is generated per
+request from the address it was asked for, so whatever you type is what the
+channel plays from.
+
+The receiver also answers to its own name over mDNS -- `relay.local`, or
+whatever the `name` option is reduced to -- which is friendlier to type and
+survives the address changing. Use it only for players on the same network
+segment. mDNS is link-local: where it has to cross a VLAN through a reflector,
+a lookup can take seconds, and a player that pays that on every connection
+buffers continuously on a stream the plain address serves perfectly. For those,
+either use the address or give the box a name in the router's own DNS.
+
 ## Tuning in before anything is playing
 
 The channel always carries something. Between streams it publishes a still

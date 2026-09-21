@@ -241,7 +241,10 @@ async function refresh() {
   // only reaches players that speak mDNS -- so it is offered, not substituted.
   const byName = $("byName");
   if (data.playlist_name_url) {
-    byName.textContent = `Players that resolve names can use ${data.playlist_name_url} instead`;
+    byName.textContent =
+      `${data.playlist_name_url} works too, but only on the same network segment: `
+      + "a .local lookup that has to cross a VLAN can take seconds, and a player "
+      + "that pays that for every connection buffers on a stream the address serves fine.";
     byName.hidden = false;
   } else {
     byName.hidden = true;
