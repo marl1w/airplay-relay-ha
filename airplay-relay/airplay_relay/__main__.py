@@ -47,6 +47,7 @@ async def run_channel(config: Config, url: str | None) -> None:
         hls_list_size=config.hls_list_size,
         user_agent=config.user_agent,
         name=config.name,
+        hostname=config.avahi_hostname,
         address=config.address,
     )
     channel.serve()

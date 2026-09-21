@@ -116,6 +116,7 @@ PAGE = """<!DOCTYPE html>
     <h2>Watch it</h2>
     <code>IPTV playlist &nbsp;<span id="playlistUrl">–</span></code>
     <code>Direct stream &nbsp;<span id="streamUrl">–</span></code>
+    <div class="idle-note" id="byName" hidden></div>
   </div>
 </div>
 
@@ -235,6 +236,16 @@ async function refresh() {
 
   $("playlistUrl").textContent = data.playlist_url || "–";
   $("streamUrl").textContent = data.stream_url || "–";
+
+  // The name is friendlier to type and survives the address changing, but it
+  // only reaches players that speak mDNS -- so it is offered, not substituted.
+  const byName = $("byName");
+  if (data.playlist_name_url) {
+    byName.textContent = `Players that resolve names can use ${data.playlist_name_url} instead`;
+    byName.hidden = false;
+  } else {
+    byName.hidden = true;
+  }
 }
 
 $("stop").addEventListener("click", async () => {

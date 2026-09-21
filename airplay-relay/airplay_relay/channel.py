@@ -154,12 +154,14 @@ class Channel:
         hls_list_size: int,
         user_agent: str = "",
         name: str = "Relay",
+        hostname: str = "",
         address: str = "",
     ) -> None:
         """Prepare the segment directory and the server that will offer it."""
         self.directory = Path(directory)
         self.user_agent = user_agent
         self.name = name
+        self.hostname = hostname
         self.address = address
         self.port = port
         self.hls_time = hls_time
@@ -282,9 +284,22 @@ class Channel:
         )
 
     async def play(self, url: str) -> None:
-        """Replace whatever is playing with the stream at this URL."""
-        await self.stop()
-        self._clear()
+        """Replace whatever is playing with the stream at this URL.
+
+        What is already on the channel decides whether it is swept away now or
+        left to cover the handover. A previous stream has to go at once: a
+        player would otherwise be served the end of something nobody chose. The
+        standby card can stay, and should -- ffmpeg takes several seconds to
+        produce its first segment, and clearing first means a player tuned in
+        early finds no playlist at all in the meantime, which is the one moment
+        the card exists to prevent.
+        """
+        covered = self.standing_by
+        self._paused_url = None
+        self.source_url = None
+        await self._halt()
+        if not covered:
+            self._clear()
         self.source_url = url
         self._last_error = None
         self._started_at = time.monotonic()
@@ -562,6 +577,17 @@ class Channel:
             "renditions": len(self._ladder.offered) if self._ladder and self.requested else None,
             "stream_url": f"http://{self.address}:{self.port}/{PLAYLIST}",
             "playlist_url": f"http://{self.address}:{self.port}/{CHANNEL_LIST}",
+            # The same two by name. Whether a television resolves it depends on
+            # whether it speaks mDNS, so the address stays alongside rather
+            # than being replaced by it.
+            "stream_name_url": (
+                f"http://{self.hostname}.local:{self.port}/{PLAYLIST}" if self.hostname else None
+            ),
+            "playlist_name_url": (
+                f"http://{self.hostname}.local:{self.port}/{CHANNEL_LIST}"
+                if self.hostname
+                else None
+            ),
             **self._details,
         }
 
@@ -606,7 +632,9 @@ class Channel:
                 # belongs to whoever is playing, and picking it up again starts
                 # from wherever they leave the numbering.
                 republisher = None
-                await asyncio.sleep(1)
+                # Short, because this is also how quickly the card comes back
+                # after a stream ends.
+                await asyncio.sleep(0.5)
                 continue
             if republisher is None:
                 republisher = Republisher(
