@@ -1,0 +1,2 @@
+# Republishes UxPlay's service record; everything else is standard library.
+zeroconf>=0.132

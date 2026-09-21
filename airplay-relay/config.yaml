@@ -1,0 +1,38 @@
+name: AirPlay Relay
+version: "0.1.0"
+slug: airplay_relay
+description: AirPlay a video from your phone and every screen in the house can watch it
+url: https://github.com/marl1w/airplay-relay-ha
+arch:
+  - amd64
+init: false
+startup: services
+boot: manual
+
+# Multicast discovery and port 7000 need the host network.
+host_network: true
+
+ingress: true
+# Fixed for an app on the host network; the stream is served from the same port.
+ingress_port: 8099
+panel_icon: mdi:cast-connected
+panel_title: Relay
+
+# Supervisor rejects a literal port here; it must be written as [PORT:nnnn].
+webui: "http://[HOST]:[PORT:8099]/"
+
+# Not published on the host network, but [PORT:8099] above is substituted from it.
+ports:
+  8099/tcp: 8099
+ports_description:
+  8099/tcp: Stream, channel list and status page
+
+options:
+  name: Relay
+  channel_port: 8099
+  log_level: info
+
+schema:
+  name: str
+  channel_port: int(1024,65535)
+  log_level: list(debug|info)
