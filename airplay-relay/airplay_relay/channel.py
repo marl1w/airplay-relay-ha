@@ -56,6 +56,10 @@ class _Handler(SimpleHTTPRequestHandler):
         elif route == "/status.json":
             self._send(json.dumps(self.channel.snapshot()).encode(), "application/json")
         elif route.endswith(".ts") or route.endswith(".m3u8"):
+            if not self.channel.requested:
+                self.channel.note_leftovers(route)
+                self.send_error(404, "nothing is playing")
+                return
             self.channel.note_viewer()
             super().do_GET()
         elif route == "/stop":
@@ -112,6 +116,7 @@ class Channel:
         self._is_hls = True
         self._loop: asyncio.AbstractEventLoop | None = None
         self._last_viewer: float = 0.0
+        self._warned_leftovers = False
         self.sender: dict[str, str] = {}
         self._sender_seen: float = 0.0
         self._needs_stripping = False
@@ -205,6 +210,21 @@ class Channel:
         if not self._sender_seen:
             return 0.0
         return time.monotonic() - self._sender_seen
+
+    def note_leftovers(self, route: str) -> None:
+        """Say once that a player asked for a window the channel has ended."""
+        if self._warned_leftovers:
+            return
+        self._warned_leftovers = True
+        segments, seconds, _ = status.window(self.directory)
+        if segments:
+            _LOGGER.warning(
+                "%s asked for with nothing playing, and %d segments (%.0fs) are still "
+                "in the directory -- the stream that wrote them ended without clearing up",
+                route,
+                segments,
+                seconds,
+            )
 
     def note_viewer(self) -> None:
         """Record that someone fetched part of the stream just now."""
@@ -488,9 +508,14 @@ class Channel:
 
     def _clear(self) -> None:
         """Remove the previous stream's segments."""
+        removed = 0
         for segment in self.directory.glob("seg_*.ts"):
             segment.unlink(missing_ok=True)
+            removed += 1
         (self.directory / PLAYLIST).unlink(missing_ok=True)
+        self._warned_leftovers = False
+        if removed:
+            _LOGGER.info("cleared %d segments", removed)
         self.directory.mkdir(parents=True, exist_ok=True)
         self._write_channel_list()
 
