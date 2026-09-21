@@ -81,6 +81,10 @@ class Config:
         # 1080p is some tens of megabytes, and writing them to disk would put
         # continuous churn on the volume that also holds backups and the
         # recorder database.
+        # The add-on's own durable volume, where what has been played is kept.
+        # It does not exist outside an add-on, and the history falls back to the
+        # channel directory when it cannot be written.
+        self.state_dir = self._setting("state_dir", "/data")
         self.channel_port = int(self._setting("channel_port", "8099"))
         self.channel_dir = self._setting("channel_dir", "/dev/shm/airplay-relay")
         # Identify as Apple's player. A CDN that serves a placeholder image to

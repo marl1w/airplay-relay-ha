@@ -43,6 +43,27 @@ pointing at the proxy. That keeps one receiver visible instead of two, and it
 gets withdrawn properly on shutdown rather than lingering as a ghost that the
 next run collides with.
 
+## After a restart
+
+An update, a crash or the box rebooting no longer costs whatever was on. Each
+stream is recorded as it plays, and a record that was still open when the add-on
+went down is the one thing it starts again on the way back up -- within a
+quarter of an hour, and only when nobody chose to end it. A stream somebody
+stopped, or one that ran out, stays stopped.
+
+## Looking back
+
+The status page has a second tab holding a month of streams: what was played,
+from where, who started it, how long it ran, the picture and the tracks it
+carried, how many were watching at the busiest, the average and peak bitrate,
+and how it ended. Each one can be expanded for the shape of the evening, and
+started again if the source still answers -- a link a phone handed over last
+week may well have expired, and then it fails like any other source that cannot
+be fetched.
+
+The record lives in the add-on's own volume, sampled every half minute, and
+anything older than a month is dropped.
+
 ## Pointing a player at it
 
     http://<home-assistant>:8099/channels.m3u

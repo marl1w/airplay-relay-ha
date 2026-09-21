@@ -15,6 +15,7 @@ import signal
 
 from .channel import Channel
 from .config import Config
+from .history import open_in
 from .mirror import Mirror, read_upstream
 from .proxy import Message, Proxy, plist_response
 from .uxplay import build_command, run as run_uxplay
@@ -40,6 +41,7 @@ def _stop_event() -> asyncio.Event:
 
 async def run_channel(config: Config, url: str | None) -> None:
     """Republish whatever the sender hands over, or one URL given on the command line."""
+    history = open_in(config.state_dir, config.channel_dir)
     channel = Channel(
         directory=config.channel_dir,
         port=config.channel_port,
@@ -49,6 +51,7 @@ async def run_channel(config: Config, url: str | None) -> None:
         name=config.name,
         hostname=config.avahi_hostname,
         address=config.address,
+        history=history,
     )
     channel.serve()
     stop = _stop_event()
@@ -58,9 +61,16 @@ async def run_channel(config: Config, url: str | None) -> None:
             await channel.play(url)
             await stop.wait()
         finally:
-            await channel.stop()
+            await channel.stop("interrupted")
             channel.close()
         return
+
+    if resuming := history.unfinished():
+        _LOGGER.warning(
+            "the last stream was still playing when the add-on stopped; starting it again: %s",
+            resuming["source_url"],
+        )
+        await channel.play(resuming["source_url"])
 
     # Which AirPlay session owns the channel. When a second video is started
     # the phone opens a new session and then tears the old one down, so a /stop
@@ -238,7 +248,10 @@ async def run_channel(config: Config, url: str | None) -> None:
     finally:
         for task in (uxplay, waiter):
             task.cancel()
-        await channel.stop()
+        # "interrupted", because this is the add-on going down -- an update, a
+        # restart, the box rebooting -- rather than anyone choosing to end the
+        # stream. That word is what makes it start again on the way back up.
+        await channel.stop("interrupted")
         channel.close()
 
 
