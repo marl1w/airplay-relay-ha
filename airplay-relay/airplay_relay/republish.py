@@ -32,21 +32,33 @@ START_SEGMENTS_BACK = 2.5
 class Republisher:
     """Keeps a rolling HLS window on disk from segments handed to it."""
 
-    def __init__(self, directory: Path, playlist: str, window: int) -> None:
-        """Publish into this directory, keeping `window` segments."""
+    def __init__(self, directory: Path, playlist: str, window: int, start: int = 0) -> None:
+        """Publish into this directory, keeping `window` segments.
+
+        `start` is where to begin numbering. A stream that replaces another has
+        to carry on from where that one left off: a player already tuned in
+        keeps the sequence numbers it has seen, and one that goes backwards --
+        or a name it has already fetched -- is one it believes it has played,
+        so it sits on the buffered remains of the old stream instead of taking
+        the new one.
+        """
         self.directory = directory
         self.playlist = playlist
         self.window = window
-        self.sequence = 0
+        self.sequence = start
         self._entries: list[tuple[str, float, bool]] = []
-        self._written = 0
+        self._written = start
+        # Whatever came before was a different timeline, whether it ended on a
+        # failure being retried or on someone choosing something else.
+        self._pending_gap = start > 0
 
     def add(self, payload: bytes, duration: float, after_gap: bool = False) -> None:
         """Write one segment and bring the playlist up to date."""
         name = f"seg_{self._written:05d}.ts"
         (self.directory / name).write_bytes(payload)
         self._written += 1
-        self._entries.append((name, duration, after_gap))
+        self._entries.append((name, duration, after_gap or self._pending_gap))
+        self._pending_gap = False
 
         while len(self._entries) > self.window:
             stale, _, _ = self._entries.pop(0)

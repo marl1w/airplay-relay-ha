@@ -157,6 +157,9 @@ class Channel:
         # Kept after the sender goes quiet, deliberately: the phone is a remote
         # control, and knowing who put a stream on is still worth showing once
         # they have locked their screen and walked off.
+        # Where the next stream starts numbering its segments. It only ever
+        # moves forward, for as long as the add-on runs -- see Republisher.
+        self._next_segment = 0
         # Reset whenever the directory is cleared, so one line is logged per
         # window left behind rather than one per request from every player.
         self._warned_leftovers = False
@@ -509,7 +512,9 @@ class Channel:
         the durations the source states, so repackaging them achieved nothing
         except to add a pipe that could stall and a process that could exit.
         """
-        republisher = Republisher(self.directory, PLAYLIST, self.hls_list_size)
+        republisher = Republisher(
+            self.directory, PLAYLIST, self.hls_list_size, start=self._numbering_starts_at()
+        )
         puller = StrippingPuller(url, self.user_agent)
         _LOGGER.info("republishing the source's own segments, unchanged")
         try:
@@ -566,8 +571,13 @@ class Channel:
             str(self.hls_list_size),
             # delete_segments keeps RAM flat; omit_endlist keeps players from
             # treating a pause in the source as the end of the stream.
+            # discont_start marks the join: what came before was a different
+            # timeline, and a player told so resets its decoder rather than
+            # trying to reconcile the timestamps.
             "-hls_flags",
-            "delete_segments+omit_endlist+temp_file",
+            "delete_segments+omit_endlist+temp_file+discont_start",
+            "-start_number",
+            str(self._numbering_starts_at()),
             "-hls_segment_type",
             "mpegts",
             "-hls_segment_filename",
@@ -584,7 +594,23 @@ class Channel:
         try:
             return await self._drain(process)
         finally:
+            # Cancelling this -- which is how every stream ends, and how one is
+            # replaced by the next -- used to clear the handle and leave the
+            # process running, because _halt kills whatever _process holds and
+            # this finally emptied it first. The orphan went on writing into
+            # the directory the next stream was about to use, so its segments
+            # reappeared after the clear and its playlist fought with the new
+            # one: viewers got the stream they had just replaced.
+            #
+            # terminate() is called before any await, so the process is dead
+            # even if the cancellation lands again on the next line.
             self._process = None
+            if process.returncode is None:
+                process.terminate()
+                with contextlib.suppress(TimeoutError, asyncio.CancelledError):
+                    await asyncio.wait_for(process.wait(), timeout=5)
+                if process.returncode is None:
+                    process.kill()
 
     async def _drain(self, process: asyncio.subprocess.Process) -> int | None:
         """Log ffmpeg's complaints until it exits, then return its code.
@@ -621,6 +647,19 @@ class Channel:
             await process.wait()
         _LOGGER.info("stopped")
 
+    def _numbering_starts_at(self) -> int:
+        """Return the first segment number a new run may use.
+
+        Read from the directory rather than remembered alone, because a run
+        that fails is retried without clearing, and the segments it managed to
+        write are still there and still spoken for.
+        """
+        for segment in self.directory.glob("seg_*.ts"):
+            with contextlib.suppress(ValueError):
+                index = int(segment.stem.removeprefix("seg_"))
+                self._next_segment = max(self._next_segment, index + 1)
+        return self._next_segment
+
     def _clear(self) -> None:
         """Remove the previous stream's segments.
 
@@ -628,6 +667,8 @@ class Channel:
         stream before, which it will happily decode into someone else's film.
         """
         removed = 0
+        # Read before the files that prove it go away.
+        self._numbering_starts_at()
         for segment in self.directory.glob("seg_*.ts"):
             segment.unlink(missing_ok=True)
             removed += 1
