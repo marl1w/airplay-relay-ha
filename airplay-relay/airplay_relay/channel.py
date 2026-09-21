@@ -791,8 +791,7 @@ class Channel:
         """
         while True:
             await asyncio.sleep(SAMPLE_SECONDS)
-            ladder = self._ladder
-            if ladder is None or self._switching:
+            if self._switching:
                 continue
             if not self.playing:
                 # A stream that is starting, retrying or stopped publishes
@@ -807,6 +806,16 @@ class Channel:
             clock = time.monotonic()
             self._pace.note(clock, status.published(self.directory))
             self._remember()
+
+            # Measured above whether or not there is a ladder: a source that
+            # offers one rendition can still fall behind, and the panel and the
+            # record are both entitled to say so. Only the choice of rendition
+            # needs somewhere to move to -- reading the ladder first meant a
+            # single-rendition stream was never sampled at all, so the panel
+            # said "starting" for as long as it ran and its history was empty.
+            ladder = self._ladder
+            if ladder is None:
+                continue
 
             behind = self._pace.ratio(clock, BEHIND_SECONDS)
             if behind is not None and behind < BEHIND_RATIO and ladder.down(clock):
