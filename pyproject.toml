@@ -31,6 +31,9 @@ ignore = [
 # Listing a tmpfs directory of a few files costs microseconds; a thread for it
 # would be more machinery than the blocking call it avoids.
 "airplay-relay/airplay_relay/status.py" = ["ASYNC240"]
+# Reading the three standby segments back happens once, at startup, before
+# anything is playing -- there is nothing for it to block.
+"airplay-relay/airplay_relay/standby.py" = ["ASYNC240"]
 
 [tool.ruff.lint.isort]
 force-sort-within-sections = true

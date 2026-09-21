@@ -84,6 +84,7 @@ PAGE = """<!DOCTYPE html>
       <div><div class="label">Audio</div><div class="value" id="audio">–</div></div>
       <div><div class="label">Playing for</div><div class="value" id="uptime">–</div></div>
       <div><div class="label">Buffer</div><div class="value" id="buffer">–</div></div>
+      <div><div class="label">Watching</div><div class="value" id="viewers">–</div></div>
       <div><div class="label">Last viewed</div><div class="value" id="viewed">–</div></div>
     </div>
   </div>
@@ -97,6 +98,7 @@ PAGE = """<!DOCTYPE html>
   <div class="card">
     <h2>Source</h2>
     <div class="value small" id="source">Nothing playing</div>
+    <div class="idle-note" id="rendition" hidden></div>
     <div class="problem" id="problem" hidden></div>
   </div>
 
@@ -148,8 +150,16 @@ async function refresh() {
     ? `${data.bitrate_kbps} kbps` : "–";
   $("video").textContent = has ? [data.video_codec, data.frame_rate && `${data.frame_rate}fps`]
     .filter(Boolean).join(" · ") : "–";
+  const tracks = (data.playing && data.audio_tracks) || [];
+  // More than one track means the player's own audio menu has something to
+  // offer, which is worth saying here: nothing on this page switches it.
+  const named = tracks.filter(Boolean);
   $("audio").textContent = data.playing && data.audio_codec
-    ? [data.audio_codec, data.audio_channels && `${data.audio_channels}ch`].filter(Boolean).join(" · ") : "–";
+    ? [
+        data.audio_codec,
+        data.audio_channels && `${data.audio_channels}ch`,
+        tracks.length > 1 && (named.length ? named.join(", ") : `${tracks.length} tracks`),
+      ].filter(Boolean).join(" · ") : "–";
   $("uptime").textContent = data.playing ? duration(data.position) : "–";
   $("buffer").textContent = data.playing
     ? `${data.window_seconds}s · ${data.segments} seg` : "–";
@@ -185,8 +195,23 @@ async function refresh() {
     source.textContent = data.source_url;
     source.classList.remove("idle-note");
   } else {
-    source.textContent = "Nothing playing — AirPlay something from your phone";
+    source.textContent = data.standby
+      ? "Nothing playing — the standby card is on the channel, so a player can tune in and wait"
+      : "Nothing playing — AirPlay something from your phone";
     source.classList.add("idle-note");
+  }
+
+  // Which of the source's renditions is being pulled, and whether the link
+  // made us settle for it. Only worth a line when there was a choice.
+  const rendition = $("rendition");
+  if (data.playing && data.renditions > 1) {
+    const chosen = `${data.rendition} at ${data.rendition_kbps} kbps`;
+    rendition.textContent = data.rendition_rung === 1
+      ? `${chosen} — the best of ${data.renditions} the source offers`
+      : `${chosen} — ${data.rendition_rung} of ${data.renditions}, stepped down to keep up`;
+    rendition.hidden = false;
+  } else {
+    rendition.hidden = true;
   }
 
   const problem = $("problem");
@@ -196,6 +221,12 @@ async function refresh() {
   } else {
     problem.hidden = true;
   }
+
+  // Counted while the standby card is up too: tuning a television in early is
+  // the point of the card, and a zero there would look like it had not worked.
+  $("viewers").textContent = (data.playing || data.standby)
+    ? (data.viewers === 1 ? "1 player" : `${data.viewers} players`)
+    : "–";
 
   $("viewed").textContent = data.playing
     ? (data.seconds_since_viewer <= 5 ? "now" : `${duration(data.seconds_since_viewer)} ago`)

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
+import contextlib
 import logging
 from urllib.parse import urljoin
 from urllib.request import Request, urlopen
@@ -72,6 +73,75 @@ def parse(playlist: str, base: str) -> list[tuple[str, float]]:
             segments.append((urljoin(base, text), duration))
             duration = 0.0
     return segments
+
+
+def _attributes(line: str, tag: str) -> dict[str, str]:
+    """Return one playlist tag's attributes, with the quotes taken off.
+
+    Split on commas outside quotes: a NAME or a URI may contain one, and
+    splitting naively turns "Espanol, latino" into two attributes and loses the
+    rest of the line.
+    """
+    text = line.removeprefix(tag)
+    parts: list[str] = []
+    quoted = False
+    current = ""
+    for character in text:
+        if character == '"':
+            quoted = not quoted
+        if character == "," and not quoted:
+            parts.append(current)
+            current = ""
+            continue
+        current += character
+    parts.append(current)
+
+    found: dict[str, str] = {}
+    for part in parts:
+        key, separator, value = part.partition("=")
+        if separator:
+            found[key.strip()] = value.strip().strip('"')
+    return found
+
+
+def variants(playlist: str) -> list[tuple[int, str, str]]:
+    """Return each rendition a master playlist offers, in the order it lists them.
+
+    Bandwidth, a description, and the audio group it draws from. Which
+    rendition to take is chosen from this, but it is fetched by ffmpeg, which
+    reads the same master and numbers its programs in the order the renditions
+    appear -- so the position in that order is what the caller maps.
+    """
+    found: list[tuple[int, str, str]] = []
+    for line in playlist.splitlines():
+        if not line.startswith("#EXT-X-STREAM-INF:"):
+            continue
+        attributes = _attributes(line, "#EXT-X-STREAM-INF:")
+        bandwidth = 0
+        with contextlib.suppress(ValueError):
+            bandwidth = int(attributes.get("BANDWIDTH", "0"))
+        found.append(
+            (bandwidth, attributes.get("RESOLUTION") or "unknown", attributes.get("AUDIO", ""))
+        )
+    return found
+
+
+def audio_renditions(playlist: str, group: str) -> list[tuple[str, str]]:
+    """Return the languages one audio group offers, in the order it lists them.
+
+    ffmpeg presents a variant's audio streams in this order but carries the
+    language tag through for only one of them, so the names have to be read
+    here and put back on the output.
+    """
+    found: list[tuple[str, str]] = []
+    for line in playlist.splitlines():
+        if not line.startswith("#EXT-X-MEDIA:"):
+            continue
+        attributes = _attributes(line, "#EXT-X-MEDIA:")
+        if attributes.get("TYPE") != "AUDIO" or attributes.get("GROUP-ID") != group:
+            continue
+        found.append((attributes.get("LANGUAGE", ""), attributes.get("NAME", "")))
+    return found
 
 
 def target_duration(playlist: str, default: float = 4.0) -> float:
