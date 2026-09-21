@@ -61,6 +61,12 @@ class _Handler(SimpleHTTPRequestHandler):
 
     channel: Channel
 
+    # HTTP/1.1 keeps one connection per player instead of one per segment request.
+    protocol_version = "HTTP/1.1"
+
+    # Kept-alive connections expire, so an abandoned player does not hold its thread.
+    timeout = 30
+
     def log_message(self, format: str, *args) -> None:
         """Keep segment and status-page requests out of the add-on log."""
 
