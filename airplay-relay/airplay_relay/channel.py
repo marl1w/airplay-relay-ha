@@ -86,6 +86,15 @@ class _Handler(SimpleHTTPRequestHandler):
         elif route == "/status.json":
             self._send(json.dumps(self.channel.snapshot()).encode(), "application/json")
         elif route.endswith(".ts") or route.endswith(".m3u8"):
+            # Nothing is playing, so there is nothing to hand over. Whatever is
+            # still in the directory belongs to a stream that has ended, and
+            # serving it would show a player the last thing that was on as
+            # though it were live -- which is the failure this guards against,
+            # not an empty window.
+            if not self.channel.requested:
+                self.channel.note_leftovers(route)
+                self.send_error(404, "nothing is playing")
+                return
             # Someone is watching. Recorded before serving, so a viewer who
             # arrives while the sender is silent still counts.
             self.channel.note_viewer()
@@ -148,6 +157,9 @@ class Channel:
         # Kept after the sender goes quiet, deliberately: the phone is a remote
         # control, and knowing who put a stream on is still worth showing once
         # they have locked their screen and walked off.
+        # Reset whenever the directory is cleared, so one line is logged per
+        # window left behind rather than one per request from every player.
+        self._warned_leftovers = False
         self.sender: dict[str, str] = {}
         self._sender_seen: float = 0.0
         # Set when the source hides its transport stream behind a prefix.
@@ -259,6 +271,27 @@ class Channel:
         if not self._sender_seen:
             return 0.0
         return time.monotonic() - self._sender_seen
+
+    def note_leftovers(self, route: str) -> None:
+        """Say once that a player asked for a window the channel has ended.
+
+        An empty directory here is ordinary: nobody has AirPlayed anything yet,
+        or the last stream was cleared properly. Segments still sitting in it
+        are not, and the count and the route are the only evidence of which
+        path stopped the stream without clearing up after itself.
+        """
+        if self._warned_leftovers:
+            return
+        self._warned_leftovers = True
+        segments, seconds, _ = status.window(self.directory)
+        if segments:
+            _LOGGER.warning(
+                "%s asked for with nothing playing, and %d segments (%.0fs) are still "
+                "in the directory -- the stream that wrote them ended without clearing up",
+                route,
+                segments,
+                seconds,
+            )
 
     def note_viewer(self) -> None:
         """Record that someone fetched part of the stream just now."""
@@ -579,9 +612,14 @@ class Channel:
         Without this a player that reconnects can be handed segments from the
         stream before, which it will happily decode into someone else's film.
         """
+        removed = 0
         for segment in self.directory.glob("seg_*.ts"):
             segment.unlink(missing_ok=True)
+            removed += 1
         (self.directory / PLAYLIST).unlink(missing_ok=True)
+        self._warned_leftovers = False
+        if removed:
+            _LOGGER.info("cleared %d segments", removed)
         self.directory.mkdir(parents=True, exist_ok=True)
         self._write_channel_list()
 

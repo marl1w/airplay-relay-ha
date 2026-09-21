@@ -144,7 +144,8 @@ async function refresh() {
 
   const has = data.playing && data.width;
   $("resolution").textContent = has ? `${data.width}×${data.height}` : "–";
-  $("bitrate").textContent = data.bitrate_kbps ? `${data.bitrate_kbps} kbps` : "–";
+  $("bitrate").textContent = data.playing && data.bitrate_kbps
+    ? `${data.bitrate_kbps} kbps` : "–";
   $("video").textContent = has ? [data.video_codec, data.frame_rate && `${data.frame_rate}fps`]
     .filter(Boolean).join(" · ") : "–";
   $("audio").textContent = data.playing && data.audio_codec
