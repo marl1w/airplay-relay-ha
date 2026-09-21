@@ -1,5 +1,5 @@
 name: AirPlay Relay
-version: "0.1.1"
+version: "0.1.2"
 slug: airplay_relay
 description: AirPlay a video from your phone and every screen in the house can watch it
 url: https://github.com/marl1w/airplay-relay-ha

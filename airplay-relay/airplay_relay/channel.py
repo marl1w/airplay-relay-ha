@@ -342,7 +342,7 @@ class Channel:
             "requested": self.requested,
             "starting": self.requested and not playing,
             "paused": self._paused_url is not None,
-            "last_error": self._last_error,
+            "last_error": None if playing else self._last_error,
             "seconds_since_viewer": round(self.seconds_since_viewer),
             "sender": self.sender,
             "sender_seen": round(self.seconds_since_sender),
@@ -486,12 +486,16 @@ class Channel:
     async def _drain(self, process: asyncio.subprocess.Process) -> int | None:
         """Log ffmpeg's complaints until it exits, then return its code."""
         assert process.stderr is not None
+        complaint = None
         async for line in process.stderr:
             text = line.decode(errors="replace").rstrip()
             if text:
                 _LOGGER.warning("ffmpeg: %s", text)
-                self._last_error = text[:200]
-        return await process.wait()
+                complaint = text[:200]
+        code = await process.wait()
+        if code:
+            self._last_error = complaint
+        return code
 
     async def _kill(self) -> None:
         """Stop the running ffmpeg, if there is one."""
