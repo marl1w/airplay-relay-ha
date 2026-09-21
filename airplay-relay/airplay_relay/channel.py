@@ -116,6 +116,7 @@ class Channel:
         self._is_hls = True
         self._loop: asyncio.AbstractEventLoop | None = None
         self._last_viewer: float = 0.0
+        self._next_segment = 0
         self._warned_leftovers = False
         self.sender: dict[str, str] = {}
         self._sender_seen: float = 0.0
@@ -417,7 +418,9 @@ class Channel:
 
     async def _attempt_stripped(self, url: str) -> int | None:
         """Pass the source's own segments through, with no ffmpeg involved."""
-        republisher = Republisher(self.directory, PLAYLIST, self.hls_list_size)
+        republisher = Republisher(
+            self.directory, PLAYLIST, self.hls_list_size, start=self._numbering_starts_at()
+        )
         puller = StrippingPuller(url, self.user_agent)
         _LOGGER.info("republishing the source's own segments, unchanged")
         try:
@@ -463,7 +466,9 @@ class Channel:
             str(self.hls_list_size),
             # omit_endlist: a source stall is not the end; discont_start: reset at each join.
             "-hls_flags",
-            "delete_segments+omit_endlist+temp_file",
+            "delete_segments+omit_endlist+temp_file+discont_start",
+            "-start_number",
+            str(self._numbering_starts_at()),
             "-hls_segment_type",
             "mpegts",
             "-hls_segment_filename",
@@ -482,6 +487,12 @@ class Channel:
         finally:
             # terminate() runs before any await, so a repeated cancellation cannot orphan it.
             self._process = None
+            if process.returncode is None:
+                process.terminate()
+                with contextlib.suppress(TimeoutError, asyncio.CancelledError):
+                    await asyncio.wait_for(process.wait(), timeout=5)
+                if process.returncode is None:
+                    process.kill()
 
     async def _drain(self, process: asyncio.subprocess.Process) -> int | None:
         """Log ffmpeg's complaints until it exits, then return its code."""
@@ -510,9 +521,19 @@ class Channel:
             await process.wait()
         _LOGGER.info("stopped")
 
+    def _numbering_starts_at(self) -> int:
+        """Return the first segment number a new run may use."""
+        for segment in self.directory.glob("seg_*.ts"):
+            with contextlib.suppress(ValueError):
+                index = int(segment.stem.removeprefix("seg_"))
+                self._next_segment = max(self._next_segment, index + 1)
+        return self._next_segment
+
     def _clear(self) -> None:
         """Remove the previous stream's segments."""
         removed = 0
+        # Read the numbering before deleting the segments it is read from.
+        self._numbering_starts_at()
         for segment in self.directory.glob("seg_*.ts"):
             segment.unlink(missing_ok=True)
             removed += 1
