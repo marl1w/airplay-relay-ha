@@ -423,7 +423,10 @@ class Channel:
             "requested": self.requested,
             "starting": self.requested and not playing,
             "paused": self._paused_url is not None,
-            "last_error": self._last_error,
+            # A problem is only a problem while there is no stream: once
+            # segments are arriving, whatever went wrong on the way was
+            # survived, and saying so over a playing channel is noise.
+            "last_error": None if playing else self._last_error,
             "seconds_since_viewer": round(self.seconds_since_viewer),
             "sender": self.sender,
             "sender_seen": round(self.seconds_since_sender),
@@ -584,14 +587,26 @@ class Channel:
             self._process = None
 
     async def _drain(self, process: asyncio.subprocess.Process) -> int | None:
-        """Log ffmpeg's complaints until it exits, then return its code."""
+        """Log ffmpeg's complaints until it exits, then return its code.
+
+        Everything ffmpeg says at this log level is worth having in the add-on
+        log, and almost none of it is fatal: "mime type is not rfc8216
+        compliant" is a CDN labelling its playlist loosely, and the stream then
+        plays for hours. Only a complaint from a run that actually failed is
+        shown on the page, or the panel reports a problem with a stream the
+        viewers are watching quite happily.
+        """
         assert process.stderr is not None
+        complaint = None
         async for line in process.stderr:
             text = line.decode(errors="replace").rstrip()
             if text:
                 _LOGGER.warning("ffmpeg: %s", text)
-                self._last_error = text[:200]
-        return await process.wait()
+                complaint = text[:200]
+        code = await process.wait()
+        if code:
+            self._last_error = complaint
+        return code
 
     async def _kill(self) -> None:
         """Stop the running ffmpeg, if there is one."""
