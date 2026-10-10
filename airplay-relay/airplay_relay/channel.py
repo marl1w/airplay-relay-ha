@@ -237,6 +237,7 @@ class Channel:
     async def play(self, url: str) -> None:
         """Replace whatever is playing with the stream at this URL."""
         covered = self.standing_by
+        self._finish("replaced")
         self._paused_url = None
         self.source_url = None
         await self._halt()
