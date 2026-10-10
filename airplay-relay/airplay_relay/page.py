@@ -342,7 +342,9 @@ async function refresh() {
     source.textContent = data.source_url;
     source.classList.remove("idle-note");
   } else {
-    source.textContent = data.standby
+    source.textContent = data.wakes_for !== null && data.wakes_for !== undefined
+      ? `Stopped because nobody was watching — tune a player in within ${duration(data.wakes_for)} to start it again`
+      : data.standby
       ? "Nothing playing — the standby card is on the channel, so a player can tune in and wait"
       : "Nothing playing — AirPlay something from your phone";
     source.classList.add("idle-note");
@@ -369,6 +371,7 @@ async function refresh() {
 
   $("viewers").textContent = (data.playing || data.standby)
     ? (data.viewers === 1 ? "1 player" : `${data.viewers} players`)
+      + (data.requested && data.stops_in !== null ? ` · stops in ${duration(data.stops_in)}` : "")
     : "–";
 
   $("viewed").textContent = data.playing

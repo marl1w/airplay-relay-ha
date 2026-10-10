@@ -35,6 +35,7 @@ VERDICT_SECONDS = 20.0
 SAMPLE_SECONDS = 5
 SETTLED_SECONDS = 60
 IDLE_MINUTES = 15
+WAKE_MINUTES = 60
 
 # Explicit: system mimetypes vary, and IPTV apps file audio/x-mpegurl lists as radio.
 mimetypes.add_type("application/vnd.apple.mpegurl", ".m3u8")
@@ -78,6 +79,8 @@ class _Handler(SimpleHTTPRequestHandler):
         elif route == "/status.json":
             self._send(json.dumps(self.channel.snapshot()).encode(), "application/json")
         elif route.endswith(".ts") or route.endswith(".m3u8"):
+            if not self.channel.requested:
+                self.channel.wake()
             # Leftovers are from an ended stream; serving them would pass it off as live.
             if not self.channel.requested and not self.channel.standing_by:
                 self.channel.note_leftovers(route)
@@ -166,6 +169,11 @@ class Channel:
         self._ladder: Ladder | None = None
         self._pace = Pace()
         self._adapter: asyncio.Task[None] | None = None
+        self._watcher: asyncio.Task[None] | None = None
+        self._stopping: asyncio.Task[None] | None = None
+        # The stream stopped for want of viewers, and when, so a player can wake it.
+        self._dozing: tuple[str, float] | None = None
+        self._dozing_lock = threading.Lock()
         self._switching = False
         self._card: list[bytes] = []
         self._idler: asyncio.Task[None] | None = None
@@ -231,6 +239,8 @@ class Channel:
     async def play(self, url: str) -> None:
         """Replace whatever is playing with the stream at this URL."""
         covered = self.standing_by
+        with self._dozing_lock:
+            self._dozing = None
         self._finish("replaced")
         self._paused_url = None
         self.source_url = None
@@ -251,6 +261,7 @@ class Channel:
         self._supervisor = asyncio.create_task(self._supervise(url))
         self._describer = asyncio.create_task(self._describe())
         self._adapter = asyncio.create_task(self._adapt())
+        self._watcher = asyncio.create_task(self._watch())
 
     async def pause(self) -> None:
         """Stop pulling but remember what was playing, so it can resume."""
@@ -350,11 +361,19 @@ class Channel:
 
     @property
     def seconds_unwatched(self) -> float:
-        """Seconds since the later of the last fetch and the start of this stream."""
-        since = max(self._last_viewer, self._started_at or 0.0)
-        if not since:
+        """How long the stream now playing has had nobody watching it."""
+        if self._started_at is None or self.viewers:
             return 0.0
-        return time.monotonic() - since
+        # The count reaches zero when the last player's watching window runs out.
+        left = self._last_viewer + WATCHING_SECONDS if self._last_viewer else 0.0
+        return max(0.0, time.monotonic() - max(left, self._started_at))
+
+    @property
+    def stops_in(self) -> float | None:
+        """Seconds until an unwatched stream is stopped, or None while someone watches."""
+        if not self.requested or self.viewers:
+            return None
+        return max(0.0, IDLE_MINUTES * 60 - self.seconds_unwatched)
 
     @property
     def seconds_since_viewer(self) -> float:
@@ -386,6 +405,8 @@ class Channel:
 
     async def stop(self, reason: str = "stopped") -> None:
         """Stop pulling and stop retrying, recording why."""
+        with self._dozing_lock:
+            self._dozing = None
         if self.history is not None:
             self.history.finish(self._session, reason)
         self._session = None
@@ -399,7 +420,8 @@ class Channel:
         supervisor, self._supervisor = self._supervisor, None
         describer, self._describer = self._describer, None
         adapter, self._adapter = self._adapter, None
-        for task in (describer, adapter):
+        watcher, self._watcher = self._watcher, None
+        for task in (describer, adapter, watcher):
             if task is not None:
                 task.cancel()
         self._switching = False
@@ -516,6 +538,8 @@ class Channel:
             "last_error": None if playing else self._last_error,
             "seconds_since_viewer": round(self.seconds_since_viewer),
             "viewers": self.viewers,
+            "stops_in": None if (left := self.stops_in) is None else round(left),
+            "wakes_for": None if (wakes := self.wakes_for) is None else round(wakes),
             "sender": self.sender,
             "sender_seen": round(self.seconds_since_sender),
             "position": round(self.position, 1),
@@ -583,6 +607,48 @@ class Channel:
             republisher.add(self._card[frame % len(self._card)], standby.SECONDS)
             frame += 1
             await asyncio.sleep(standby.SECONDS)
+
+    async def _watch(self) -> None:
+        """Stop the stream once nobody has watched it for IDLE_MINUTES."""
+        while True:
+            await asyncio.sleep(SAMPLE_SECONDS)
+            if self.seconds_unwatched >= IDLE_MINUTES * 60:
+                break
+        _LOGGER.info(
+            "nobody has watched for %d minutes; stopping until a player tunes in again",
+            IDLE_MINUTES,
+        )
+        # A task of its own, because stop() cancels this one.
+        self._stopping = asyncio.create_task(self._doze())
+
+    async def _doze(self) -> None:
+        """Stop the unwatched stream, remembering it so a player can wake it."""
+        url = self.source_url
+        await self.stop("nobody watching")
+        if url:
+            with self._dozing_lock:
+                self._dozing = (url, time.monotonic())
+
+    @property
+    def wakes_for(self) -> float | None:
+        """Seconds left in which a player tuning in restarts the stream, or None."""
+        dozing = self._dozing
+        if dozing is None or self.requested:
+            return None
+        left = WAKE_MINUTES * 60 - (time.monotonic() - dozing[1])
+        return left if left > 0 else None
+
+    def wake(self) -> None:
+        """Restart the stream that stopped for want of viewers, if it is still recent."""
+        with self._dozing_lock:
+            dozing, self._dozing = self._dozing, None
+        if dozing is None or self._loop is None:
+            return
+        url, since = dozing
+        if time.monotonic() - since > WAKE_MINUTES * 60:
+            return
+        _LOGGER.info("a player tuned in; starting the stream again: %s", url)
+        self._loop.call_soon_threadsafe(lambda: asyncio.create_task(self.play(url)))
 
     async def _adapt(self) -> None:
         """Move down the source's renditions when the link cannot keep up."""
@@ -682,13 +748,6 @@ class Channel:
                 _LOGGER.info("the source finished after %.0fs", ran_for)
                 self.source_url = None
                 self._finish("finished")
-                self._clear()
-                return
-
-            if self.seconds_unwatched > IDLE_MINUTES * 60:
-                _LOGGER.info("nobody has watched for %d minutes; stopping", IDLE_MINUTES)
-                self.source_url = None
-                self._finish("nobody watching")
                 self._clear()
                 return
 
