@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import time
 
-from airplay_relay.channel import Channel
+from airplay_relay.channel import IDLE_MINUTES, Channel
 from airplay_relay.history import History
 
 
@@ -39,6 +40,57 @@ def test_a_replaced_stream_is_recorded_as_ended(tmp_path) -> None:
 
         await channel.stop()
         assert second["reason"] == "stopped"
+
+    asyncio.run(scenario())
+
+
+def _drops_once(channel: Channel) -> asyncio.Event:
+    """Have the source drop once, when the returned event is set."""
+    drop = asyncio.Event()
+    calls = 0
+
+    async def attempt(url: str) -> int:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            await drop.wait()
+            return 1
+        await asyncio.Event().wait()
+        return 0
+
+    channel._attempt = attempt
+    return drop
+
+
+def test_a_new_stream_is_not_judged_on_who_watched_the_last_one(tmp_path) -> None:
+    async def scenario() -> None:
+        channel = _channel(tmp_path)
+        drop = _drops_once(channel)
+        channel._last_viewer = time.monotonic() - 3 * 3600
+
+        await channel.play("https://example.com/live.m3u8")
+        drop.set()
+        await asyncio.sleep(0.1)
+
+        assert channel.requested
+        assert channel.history.sessions[-1]["reason"] is None
+        await channel.stop()
+
+    asyncio.run(scenario())
+
+
+def test_a_stream_nobody_has_watched_for_a_while_still_stops(tmp_path) -> None:
+    async def scenario() -> None:
+        channel = _channel(tmp_path)
+        drop = _drops_once(channel)
+
+        await channel.play("https://example.com/live.m3u8")
+        channel._started_at = time.monotonic() - (IDLE_MINUTES + 1) * 60
+        drop.set()
+        await asyncio.sleep(0.1)
+
+        assert not channel.requested
+        assert channel.history.sessions[-1]["reason"] == "nobody watching"
 
     asyncio.run(scenario())
 

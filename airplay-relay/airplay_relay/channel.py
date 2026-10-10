@@ -26,20 +26,14 @@ from .republish import Republisher
 _LOGGER = logging.getLogger(__name__)
 
 PLAYLIST = "channel.m3u8"
-
 CHANNEL_LIST = "channels.m3u"
 LOGO = "logo.png"
 
 RETRY_DELAYS = (1, 2, 4, 8, 15, 30)
-
 WATCHING_SECONDS = 30
-
 VERDICT_SECONDS = 20.0
-
 SAMPLE_SECONDS = 5
-
 SETTLED_SECONDS = 60
-
 IDLE_MINUTES = 15
 
 # Explicit: system mimetypes vary, and IPTV apps file audio/x-mpegurl lists as radio.
@@ -353,6 +347,14 @@ class Channel:
             if seen < cutoff:
                 self._viewers.pop(peer, None)
         return len(self._viewers)
+
+    @property
+    def seconds_unwatched(self) -> float:
+        """Seconds since the later of the last fetch and the start of this stream."""
+        since = max(self._last_viewer, self._started_at or 0.0)
+        if not since:
+            return 0.0
+        return time.monotonic() - since
 
     @property
     def seconds_since_viewer(self) -> float:
@@ -683,7 +685,7 @@ class Channel:
                 self._clear()
                 return
 
-            if self.seconds_since_viewer > IDLE_MINUTES * 60:
+            if self.seconds_unwatched > IDLE_MINUTES * 60:
                 _LOGGER.info("nobody has watched for %d minutes; stopping", IDLE_MINUTES)
                 self.source_url = None
                 self._finish("nobody watching")
