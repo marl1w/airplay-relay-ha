@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Awaitable, Callable
+import contextlib
 import logging
 import plistlib
 import pprint
+import socket
 from typing import Any
 
 from .timing import TimingRelay
@@ -19,6 +21,14 @@ INTERCEPTED = ("/play", "/playback-info", "/scrub", "/rate", "/stop", "/action")
 
 # Polled about twice a second, so not logged.
 CHATTER = ("/playback-info", "/feedback", "/scrub")
+
+# UxPlay takes one client at a time, so a silent session would lock out every sender.
+IDLE_SECONDS = 60.0
+
+# Detects a vanished sender on the reverse channel, where silence is normal.
+KEEPALIVE_IDLE = 30
+KEEPALIVE_INTERVAL = 10
+KEEPALIVE_COUNT = 3
 
 
 class Message:
@@ -139,12 +149,14 @@ class Proxy:
         upstream_port: int,
         responder: Responder,
         observer: Callable[[Message], None] | None = None,
+        idle_seconds: float = IDLE_SECONDS,
     ) -> None:
         """Listen on one port and forward to UxPlay on another."""
         self.listen_port = listen_port
         self.upstream_port = upstream_port
         self._responder = responder
         self._observer = observer
+        self._idle_seconds = idle_seconds
 
     async def serve(self) -> asyncio.Server:
         """Start accepting sessions."""
@@ -159,6 +171,7 @@ class Proxy:
         peer = client_writer.get_extra_info("peername")
         label = f"{peer[0]}:{peer[1]}" if peer else "?"
         _LOGGER.info("session from %s", label)
+        _keep_alive(client_writer)
         upstream_reader = upstream_writer = None
         timing: TimingRelay | None = None
         try:
@@ -166,7 +179,19 @@ class Proxy:
                 "127.0.0.1", self.upstream_port
             )
             while True:
-                request = await read_message(client_reader)
+                try:
+                    request = await asyncio.wait_for(
+                        read_message(client_reader), timeout=self._idle_seconds
+                    )
+                except TimeoutError:
+                    # Only the session ends; the channel keeps playing without it.
+                    _LOGGER.warning(
+                        "nothing from %s for %.0fs; letting the session go so the "
+                        "next sender is accepted -- the stream carries on",
+                        label,
+                        self._idle_seconds,
+                    )
+                    break
                 if request is None:
                     break
 
@@ -221,6 +246,23 @@ class Proxy:
                     writer.close()
 
 
+def _keep_alive(writer: asyncio.StreamWriter) -> None:
+    """Have the kernel probe a sender's connection that has gone quiet."""
+    sock = writer.get_extra_info("socket")
+    if sock is None:
+        return
+    with contextlib.suppress(OSError):
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    for option, value in (
+        ("TCP_KEEPIDLE", KEEPALIVE_IDLE),
+        ("TCP_KEEPINTVL", KEEPALIVE_INTERVAL),
+        ("TCP_KEEPCNT", KEEPALIVE_COUNT),
+    ):
+        if hasattr(socket, option):
+            with contextlib.suppress(OSError):
+                sock.setsockopt(socket.IPPROTO_TCP, getattr(socket, option), value)
+
+
 def _empty_ok(request: Message) -> bytes:
     """Return a bare 200 for a request we chose not to answer with a body."""
     head = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n"
@@ -251,12 +293,11 @@ async def _shuttle(
     """Carry raw bytes both ways until either side stops."""
 
     async def pump(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-        try:
+        # OSError, not just resets: an unanswered keepalive ends the read with ETIMEDOUT.
+        with contextlib.suppress(OSError):
             while chunk := await reader.read(65536):
                 writer.write(chunk)
                 await writer.drain()
-        except (ConnectionResetError, BrokenPipeError):
-            pass
 
     await asyncio.wait(
         {
