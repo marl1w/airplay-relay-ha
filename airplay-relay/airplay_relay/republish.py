@@ -8,8 +8,8 @@ from pathlib import Path
 
 _LOGGER = logging.getLogger(__name__)
 
-# Segments back from the live edge where players start, so they start in step.
-START_SEGMENTS_BACK = 2.5
+# Seconds back from the live edge where players start: in step, and with a buffer.
+START_SECONDS_BACK = 20.0
 
 
 class Republisher:
@@ -53,7 +53,7 @@ class Republisher:
         held = sum(duration for _, duration, _ in self._entries)
         if held:
             # Clamped so it never points before the oldest segment still held.
-            offset = min(longest * START_SEGMENTS_BACK, max(0.0, held - longest / 2))
+            offset = min(START_SECONDS_BACK, max(0.0, held - longest / 2))
             lines.append(f"#EXT-X-START:TIME-OFFSET=-{offset:.3f},PRECISE=YES")
         for name, duration, after_gap in self._entries:
             if after_gap:

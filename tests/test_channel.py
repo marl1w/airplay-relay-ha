@@ -212,3 +212,19 @@ def test_a_stream_stopped_from_the_panel_does_not_wake(tmp_path) -> None:
         assert not channel.requested
 
     asyncio.run(scenario())
+
+
+def test_numbering_keeps_moving_forward_across_a_restart(tmp_path, monkeypatch) -> None:
+    now = 1_791_650_000.0
+    monkeypatch.setattr(time, "time", lambda: now)
+    before = _channel(tmp_path / "before")
+    first = before._numbering_starts_at()
+    # Ten minutes of 6-second segments, as fast as a live stream can produce them.
+    last = first + 100
+    before.directory.mkdir(parents=True)
+    (before.directory / f"seg_{last:05d}.ts").write_bytes(b"")
+
+    now += 600 + 5
+    after = _channel(tmp_path / "after")
+    after.directory.mkdir(parents=True)
+    assert after._numbering_starts_at() > last

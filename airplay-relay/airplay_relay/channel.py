@@ -36,6 +36,8 @@ SAMPLE_SECONDS = 5
 SETTLED_SECONDS = 60
 IDLE_MINUTES = 15
 WAKE_MINUTES = 60
+# 2026-01-01 UTC, so clock-based segment numbers stay small.
+NUMBERING_EPOCH = 1_767_225_600
 
 # Explicit: system mimetypes vary, and IPTV apps file audio/x-mpegurl lists as radio.
 mimetypes.add_type("application/vnd.apple.mpegurl", ".m3u8")
@@ -891,6 +893,10 @@ class Channel:
             with contextlib.suppress(ValueError):
                 index = int(segment.stem.removeprefix("seg_"))
                 self._next_segment = max(self._next_segment, index + 1)
+        # Never below the clock: segments come slower than one a second, so numbering
+        # keeps moving forward across restarts, and players never see it go back.
+        clock = int(time.time()) - NUMBERING_EPOCH
+        self._next_segment = max(self._next_segment, clock)
         return self._next_segment
 
     def _clear(self) -> None:
