@@ -17,7 +17,7 @@ from urllib.request import Request, urlopen
 
 from . import standby, status
 from .history import History
-from .hls import StrippingPuller, audio_renditions, payload_offset, variants
+from .hls import LEAD_SECONDS, StrippingPuller, audio_renditions, payload_offset, variants
 from .logo import draw as draw_logo
 from .pacing import BEHIND_RATIO, BEHIND_SECONDS, STEADY_RATIO, STEADY_SECONDS, Ladder, Pace
 from .page import PAGE
@@ -34,6 +34,9 @@ WATCHING_SECONDS = 30
 VERDICT_SECONDS = 20.0
 SAMPLE_SECONDS = 5
 SETTLED_SECONDS = 60
+# Extra delay granted to a struggling stream: a step at a time, up to a ceiling.
+CUSHION_STEP = 15.0
+CUSHION_MAX = 45.0
 IDLE_MINUTES = 15
 WAKE_MINUTES = 60
 # 2026-01-01 UTC, so clock-based segment numbers stay small.
@@ -177,6 +180,10 @@ class Channel:
         self._dozing: tuple[str, float] | None = None
         self._dozing_lock = threading.Lock()
         self._switching = False
+        self._republisher: Republisher | None = None
+        self._puller: StrippingPuller | None = None
+        self._cushion = 0.0
+        self._cushion_changed = 0.0
         self._card: list[bytes] = []
         self._idler: asyncio.Task[None] | None = None
 
@@ -428,6 +435,7 @@ class Channel:
                 task.cancel()
         self._switching = False
         self._pace = Pace()
+        self._cushion = 0.0
         self._started_at = None
         self._details = {}
         if supervisor is not None:
@@ -673,6 +681,8 @@ class Channel:
                 continue
 
             behind = self._pace.ratio(clock, BEHIND_SECONDS)
+            if behind is not None and behind < BEHIND_RATIO and self._widen(clock):
+                continue
             if behind is not None and behind < BEHIND_RATIO and ladder.down(clock):
                 await self._change_rendition(
                     f"published {behind:.0%} of real time over the last "
@@ -681,10 +691,46 @@ class Channel:
                 continue
 
             settled = self._pace.ratio(clock, STEADY_SECONDS)
+            if settled is not None and settled >= STEADY_RATIO and self._narrow(clock):
+                continue
             if settled is not None and settled >= STEADY_RATIO and ladder.up(clock):
                 await self._change_rendition(
                     f"kept up for {STEADY_SECONDS / 60:.0f} minutes, so there is room for more"
                 )
+
+    def _apply_cushion(self) -> None:
+        """Give the republishing pair the delay currently granted."""
+        if self._republisher is not None:
+            self._republisher.widen(self._cushion)
+        if self._puller is not None:
+            self._puller.lead = LEAD_SECONDS + self._cushion
+
+    def _widen(self, clock: float) -> bool:
+        """Accept more delay before giving up quality. False if that is not possible."""
+        if self._republisher is None or self._cushion >= CUSHION_MAX:
+            return False
+        self._cushion = min(CUSHION_MAX, self._cushion + CUSHION_STEP)
+        self._cushion_changed = clock
+        self._apply_cushion()
+        # Judged afresh, so the extra delay gets time to show whether it was enough.
+        self._pace.reset()
+        _LOGGER.warning(
+            "the link is behind; players now start %.0fs further back and the feed may "
+            "run %.0fs ahead",
+            self._cushion,
+            self._cushion,
+        )
+        return True
+
+    def _narrow(self, clock: float) -> bool:
+        """Give back a step of delay once the stream has held steady for a while."""
+        if self._cushion <= 0 or clock - self._cushion_changed < STEADY_SECONDS:
+            return False
+        self._cushion = max(0.0, self._cushion - CUSHION_STEP)
+        self._cushion_changed = clock
+        self._apply_cushion()
+        _LOGGER.info("steady again; players start %.0fs further back than usual", self._cushion)
+        return True
 
     def _remember(self) -> None:
         """Add the stream's current shape to its own record."""
@@ -781,6 +827,8 @@ class Channel:
             self.directory, PLAYLIST, self.hls_list_size, start=self._numbering_starts_at()
         )
         puller = StrippingPuller(url, self.user_agent)
+        self._republisher, self._puller = republisher, puller
+        self._apply_cushion()
         _LOGGER.info("republishing the source's own segments, unchanged")
         try:
             await puller.run(republisher.add)
@@ -789,6 +837,8 @@ class Channel:
         except Exception as error:
             self._last_error = f"source stopped: {error}"
             _LOGGER.error("the source stopped: %s", error)
+        finally:
+            self._republisher = self._puller = None
         return 0
 
     async def _attempt_direct(self, url: str) -> int | None:
@@ -805,6 +855,17 @@ class Channel:
             "-probesize",
             "50000000",
             *(("-user_agent", self.user_agent) if self.user_agent else ()),
+            # Keep connections open between segments, and ride out a dropped one.
+            "-http_persistent",
+            "1",
+            "-multiple_requests",
+            "1",
+            "-reconnect",
+            "1",
+            "-reconnect_streamed",
+            "1",
+            "-reconnect_delay_max",
+            "2",
             # Accept any segment extension; each switch is the spelling of one ffmpeg version.
             "-extension_picky",
             "0",

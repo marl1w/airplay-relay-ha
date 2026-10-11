@@ -7,7 +7,8 @@ from collections.abc import Callable
 import contextlib
 import logging
 from urllib.parse import urljoin
-from urllib.request import Request, urlopen
+
+from .fetch import Fetcher
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -21,6 +22,9 @@ REMEMBER = 256
 
 # Maximum seconds the feed may run ahead of real time.
 LEAD_SECONDS = 12.0
+
+# Segments fetched at once, so one slow transfer does not hold up the rest.
+PARALLEL = 3
 
 
 def payload_offset(data: bytes) -> int:
@@ -126,6 +130,8 @@ class StrippingPuller:
         """Pull the playlist at this URL, identifying as the given client."""
         self.url = url
         self.user_agent = user_agent
+        self.lead = LEAD_SECONDS
+        self._fetcher = Fetcher(user_agent)
         self.segments = 0
         self.stripped_bytes = 0
         self._seen: list[str] = []
@@ -133,9 +139,7 @@ class StrippingPuller:
         self._started = 0.0
 
     def _fetch(self, url: str) -> bytes:
-        headers = {"User-Agent": self.user_agent} if self.user_agent else {}
-        with urlopen(Request(url, headers=headers), timeout=20) as response:
-            return response.read()
+        return self._fetcher.get(url)
 
     async def run(self, write: Callable[[bytes, float, bool], object]) -> None:
         """Poll the playlist and pass each new segment to `write`, until cancelled."""
@@ -159,33 +163,46 @@ class StrippingPuller:
                 if url.split("?")[0] not in self._seen
             ]
 
-            for segment, seconds in fresh:
+            for segment, _ in fresh:
                 self._seen.append(segment.split("?")[0])
-                del self._seen[:-REMEMBER]
-                try:
-                    data = await loop.run_in_executor(None, self._fetch, segment)
-                except Exception as error:
-                    _LOGGER.warning("segment fetch failed: %s", error)
-                    missed = True
-                    continue
+            del self._seen[:-REMEMBER]
 
-                offset = payload_offset(data)
-                if offset and self.segments == 0:
-                    _LOGGER.info("stripping %d bytes of prefix from each segment", offset)
-                self.segments += 1
-                self.stripped_bytes += offset
-                if not self._started:
-                    self._started = asyncio.get_running_loop().time()
-                result = write(data[offset:], seconds, missed)
-                if asyncio.iscoroutine(result):
-                    await result
-                missed = False
+            # All started now, up to PARALLEL at a time, but written in playlist order.
+            gate = asyncio.Semaphore(PARALLEL)
 
-                # Hold the feed near real time so the live window does not outrun players.
-                self._written += seconds
-                loop_now = asyncio.get_running_loop().time()
-                ahead = self._written - (loop_now - self._started)
-                if ahead > LEAD_SECONDS:
-                    await asyncio.sleep(ahead - LEAD_SECONDS)
+            async def download(segment: str, gate: asyncio.Semaphore = gate) -> bytes:
+                async with gate:
+                    return await loop.run_in_executor(None, self._fetch, segment)
+
+            downloads = [asyncio.ensure_future(download(segment)) for segment, _ in fresh]
+            try:
+                for (_segment, seconds), download_task in zip(fresh, downloads, strict=True):
+                    try:
+                        data = await download_task
+                    except Exception as error:
+                        _LOGGER.warning("segment fetch failed: %s", error)
+                        missed = True
+                        continue
+
+                    offset = payload_offset(data)
+                    if offset and self.segments == 0:
+                        _LOGGER.info("stripping %d bytes of prefix from each segment", offset)
+                    self.segments += 1
+                    self.stripped_bytes += offset
+                    if not self._started:
+                        self._started = loop.time()
+                    result = write(data[offset:], seconds, missed)
+                    if asyncio.iscoroutine(result):
+                        await result
+                    missed = False
+
+                    # Hold the feed near real time so the live window does not outrun players.
+                    self._written += seconds
+                    ahead = self._written - (loop.time() - self._started)
+                    if ahead > self.lead:
+                        await asyncio.sleep(ahead - self.lead)
+            finally:
+                for download_task in downloads:
+                    download_task.cancel()
 
             await asyncio.sleep(wait)

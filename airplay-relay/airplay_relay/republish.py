@@ -21,6 +21,8 @@ class Republisher:
         self.playlist = playlist
         self.window = window
         self.sequence = start
+        # Seconds of delay beyond START_SECONDS_BACK that players are given.
+        self.extra = 0.0
         self._entries: list[tuple[str, float, bool]] = []
         self._written = start
         # Segments numbered before `start` belong to a different timeline.
@@ -34,12 +36,23 @@ class Republisher:
         self._entries.append((name, duration, after_gap or self._pending_gap))
         self._pending_gap = False
 
-        while len(self._entries) > self.window:
+        while len(self._entries) > self._kept():
             stale, _, _ = self._entries.pop(0)
             (self.directory / stale).unlink(missing_ok=True)
             self.sequence += 1
 
         self._write_playlist()
+
+    def _kept(self) -> int:
+        """Return how many segments to hold, enough to cover the extra delay."""
+        longest = max((duration for _, duration, _ in self._entries), default=1.0)
+        return self.window + math.ceil(self.extra / max(longest, 1.0))
+
+    def widen(self, extra: float) -> None:
+        """Start players `extra` seconds further back, holding more segments to allow it."""
+        self.extra = max(0.0, extra)
+        if self._entries:
+            self._write_playlist()
 
     def _write_playlist(self) -> None:
         """Write the playlist atomically so a player never reads a partial one."""
@@ -53,7 +66,7 @@ class Republisher:
         held = sum(duration for _, duration, _ in self._entries)
         if held:
             # Clamped so it never points before the oldest segment still held.
-            offset = min(START_SECONDS_BACK, max(0.0, held - longest / 2))
+            offset = min(START_SECONDS_BACK + self.extra, max(0.0, held - longest / 2))
             lines.append(f"#EXT-X-START:TIME-OFFSET=-{offset:.3f},PRECISE=YES")
         for name, duration, after_gap in self._entries:
             if after_gap:
