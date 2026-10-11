@@ -355,7 +355,7 @@ class Channel:
         _, seconds, size = status.window(self.directory)
         bitrate = size * 8 / seconds / 1000 if seconds > 0 else None
         if slow := self.slow_player(clock, bitrate):
-            peer, rate, dropped = slow
+            peer, rate, _ = slow
             return {
                 "state": "poor",
                 "because": f"the player at {peer} dropped a download part-way",
