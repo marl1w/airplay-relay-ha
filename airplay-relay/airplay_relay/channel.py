@@ -54,6 +54,9 @@ WATCHING_SECONDS = 30
 VERDICT_SECONDS = 20.0
 # How far back a slow or dropped download still counts against the stream.
 PLAYER_SECONDS = 45.0
+# CPU pressure (percent of time waiting for a CPU) past which streaming suffers.
+CPU_BUSY_NOW = 10.0
+CPU_BUSY_LATELY = 8.0
 SAMPLE_SECONDS = 5
 SETTLED_SECONDS = 60
 # Extra delay granted to a struggling stream: a step at a time, up to a ceiling.
@@ -352,6 +355,14 @@ class Channel:
         if not self.playing:
             return {"state": "idle", "because": "nothing is playing"}
         clock = time.monotonic()
+        if starved := self._starved_of_cpu():
+            return {
+                "state": "poor",
+                "because": f"the box is short of CPU ({starved[0]:.0f}% of the last 10s spent "
+                "waiting for it); something else on this Home Assistant is competing, "
+                "so segments arrive and leave late",
+                "cpu_pressure": starved[0],
+            }
         _, seconds, size = status.window(self.directory)
         bitrate = size * 8 / seconds / 1000 if seconds > 0 else None
         if slow := self.slow_player(clock, bitrate):
@@ -484,6 +495,14 @@ class Channel:
         self._last_viewer = time.monotonic()
         if peer:
             self._viewers[peer] = self._last_viewer
+
+    @staticmethod
+    def _starved_of_cpu() -> tuple[float, float] | None:
+        """Return the CPU pressure if the host is too busy to serve a stream on time."""
+        pressure = status.cpu_pressure()
+        if pressure and (pressure[0] >= CPU_BUSY_NOW or pressure[1] >= CPU_BUSY_LATELY):
+            return pressure
+        return None
 
     def note_transfer(self, peer: str, size: int, seconds: float, complete: bool) -> None:
         """Record how a segment went to a player: how much, how fast, and whether it finished."""
@@ -758,6 +777,7 @@ class Channel:
             "quality": self.quality(),
             "fetching": self.fetching if self.requested else None,
             "extra_delay_seconds": round(self.extra_delay),
+            "cpu_pressure": (status.cpu_pressure() or (None,))[0],
             "buffer_seconds": round(self._republisher.depth) if self._republisher else None,
             "reservoir_seconds": round(self._republisher.reservoir) if self._republisher else None,
             "session_id": self._session["id"] if self._session else None,

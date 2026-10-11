@@ -39,6 +39,19 @@ def window(directory: Path) -> tuple[int, float, int]:
     return len(names), _playlist_duration(directory), total
 
 
+def cpu_pressure() -> tuple[float, float] | None:
+    """Return the share of the last 10s and 60s that something waited for a CPU, in percent.
+
+    The host's figure, read from inside the add-on, so it includes every other add-on.
+    """
+    try:
+        line = Path("/proc/pressure/cpu").read_text(encoding="utf-8").splitlines()[0]
+        figures = dict(part.split("=") for part in line.split()[1:])
+        return float(figures["avg10"]), float(figures["avg60"])
+    except (OSError, IndexError, KeyError, ValueError):
+        return None
+
+
 def dns_name(address: str) -> str:
     """Return the name this address is registered under, or nothing."""
     try:

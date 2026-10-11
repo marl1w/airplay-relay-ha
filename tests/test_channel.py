@@ -259,3 +259,15 @@ def test_healthy_players_raise_no_alarm(tmp_path) -> None:
     channel.note_transfer("10.0.0.5", 6_000_000, 1.0, True)
 
     assert channel.slow_player(time.monotonic() + 1, 8000) is None
+
+
+def test_a_cpu_starved_box_is_named_as_the_cause(tmp_path, monkeypatch) -> None:
+    channel = Channel(str(tmp_path), 0, 2, 6)
+    monkeypatch.setattr(channel_module.status, "cpu_pressure", lambda: (25.0, 12.0))
+    assert channel._starved_of_cpu() == (25.0, 12.0)
+
+    monkeypatch.setattr(channel_module.status, "cpu_pressure", lambda: (2.0, 4.0))
+    assert channel._starved_of_cpu() is None
+
+    monkeypatch.setattr(channel_module.status, "cpu_pressure", lambda: None)
+    assert channel._starved_of_cpu() is None
