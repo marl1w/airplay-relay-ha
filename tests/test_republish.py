@@ -27,3 +27,15 @@ def test_a_short_window_starts_players_within_what_is_held(tmp_path) -> None:
         republisher.add(b"\x47" * 188, 2.0)
 
     assert _start_offset(tmp_path) == 5.0
+
+
+def test_the_window_counts_only_what_players_are_offered(tmp_path) -> None:
+    from airplay_relay import status
+
+    republisher = Republisher(tmp_path, "channel.m3u8", window=20)
+    republisher.widen(12)
+    for _ in range(5):
+        republisher.add(b"\x47" * 1000, 6.0, now=0.0)
+
+    segments, seconds, size = status.window(tmp_path)
+    assert (segments, seconds, size) == (3, 18.0, 3000)

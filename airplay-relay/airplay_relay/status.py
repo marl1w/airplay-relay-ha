@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 from pathlib import Path
@@ -29,10 +30,13 @@ def source_host(url: str | None) -> str | None:
 
 def window(directory: Path) -> tuple[int, float, int]:
     """Return how many segments are held, how many seconds, and how many bytes."""
-    segments = sorted(directory.glob("seg_*.ts"))
-    total = sum(segment.stat().st_size for segment in segments if segment.exists())
-    seconds = _playlist_duration(directory)
-    return len(segments), seconds, total
+    # Only what the playlist lists: a smoothed feed holds more files than players are offered.
+    names = [name for name, _ in published(directory)]
+    total = 0
+    for name in names:
+        with contextlib.suppress(OSError):
+            total += (directory / name).stat().st_size
+    return len(names), _playlist_duration(directory), total
 
 
 def dns_name(address: str) -> str:
