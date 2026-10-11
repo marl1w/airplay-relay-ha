@@ -228,3 +228,13 @@ def test_numbering_keeps_moving_forward_across_a_restart(tmp_path, monkeypatch) 
     after = _channel(tmp_path / "after")
     after.directory.mkdir(parents=True)
     assert after._numbering_starts_at() > last
+
+
+def test_the_snapshot_says_how_the_stream_is_fetched(tmp_path) -> None:
+    channel = Channel(str(tmp_path), 0, 2, 6)
+    assert channel.fetching == "ffmpeg"
+    assert channel.snapshot()["extra_delay_seconds"] == 0
+    channel._pulling = True
+    channel._cushion = 30.0
+    assert channel.fetching == "parallel"
+    assert channel.snapshot()["extra_delay_seconds"] == 30

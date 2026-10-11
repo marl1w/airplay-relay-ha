@@ -341,6 +341,16 @@ class Channel:
         }
 
     @property
+    def fetching(self) -> str:
+        """How the source is being fetched: by ffmpeg, or in parallel by the relay."""
+        return "parallel" if self._pulling or self._needs_stripping else "ffmpeg"
+
+    @property
+    def extra_delay(self) -> float:
+        """Seconds of delay granted beyond the usual, because the stream was behind."""
+        return self._cushion
+
+    @property
     def standing_by(self) -> bool:
         """Whether the channel is carrying the standby card."""
         return bool(self._card) and not self.requested
@@ -611,6 +621,8 @@ class Channel:
             "bitrate_kbps": bitrate,
             "standby": self.standing_by,
             "quality": self.quality(),
+            "fetching": self.fetching if self.requested else None,
+            "extra_delay_seconds": round(self.extra_delay),
             "session_id": self._session["id"] if self._session else None,
             "session_started": self._session["started"] if self._session else None,
             "samples": self._session["samples"][-240:] if self._session else [],
@@ -800,6 +812,8 @@ class Channel:
                 "viewers": self.viewers,
                 "kbps": round(size * 8 / seconds / 1000) if seconds > 0 else None,
                 "rung": (self._ladder.rung + 1) if self._ladder else None,
+                "fetching": self.fetching,
+                "extra_delay": round(self._cushion),
                 "state": verdict["state"],
             },
         )

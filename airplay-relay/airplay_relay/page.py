@@ -147,6 +147,7 @@ PAGE = """<!DOCTYPE html>
       <div>
         <div class="word" id="verdictWord">–</div>
         <div class="because" id="verdictWhy">waiting for the first figures</div>
+        <div class="because" id="verdictHelp" hidden></div>
       </div>
     </div>
     <div class="chart">
@@ -407,6 +408,12 @@ function showQuality(data) {
     starting: "Starting", idle: "Nothing playing",
   }[verdict.state] || "–";
   $("verdictWhy").textContent = verdict.because || "";
+  const help = $("verdictHelp");
+  const aids = [];
+  if (data.fetching === "parallel") aids.push("fetching over parallel connections");
+  if (data.extra_delay_seconds) aids.push(`+${data.extra_delay_seconds}s delay`);
+  help.textContent = data.playing && aids.length ? "Helping: " + aids.join(" · ") : "";
+  help.hidden = !help.textContent;
 
   const samples = data.samples || [];
   drawChart($("chartViewers"),
@@ -424,11 +431,13 @@ function showQuality(data) {
     const rates = samples.filter(s => s.kbps).map(s => s.kbps);
     const mean = rates.length ? Math.round(rates.reduce((a, b) => a + b, 0) / rates.length) : null;
     const stepped = samples.filter(s => s.rung > 1).length;
+    const parallel = samples.filter(s => s.fetching === "parallel").length;
     recap.textContent = `Since ${timeOfDay(data.session_started)}: `
       + `${peak} player${peak === 1 ? "" : "s"} at the busiest`
       + (mean ? `, ${mean} kbps on average` : "")
       + (stepped ? `, ${stepped} reading${stepped === 1 ? "" : "s"} below the best rendition`
-                 : ", never below the best rendition");
+                 : ", never below the best rendition")
+      + (parallel ? `, parallel fetching for ${parallel} reading${parallel === 1 ? "" : "s"}` : "");
     recap.hidden = false;
   } else {
     recap.hidden = true;
@@ -460,6 +469,8 @@ function renderPast(sessions) {
     const from = [who.app, who.device || who.model].filter(Boolean).join(" from ");
     const rates = (session.samples || []).filter(s => s.kbps).map(s => s.kbps);
     const worst = (session.samples || []).filter(s => s.state === "poor").length;
+    const parallel = (session.samples || []).filter(s => s.fetching === "parallel").length;
+    const delay = Math.max(0, ...(session.samples || []).map(s => s.extra_delay || 0));
 
     const row = document.createElement("div");
     row.className = "past";
@@ -483,6 +494,8 @@ function renderPast(sessions) {
       + figure("peak", session.peak_kbps ? `${session.peak_kbps} kbps` : null)
       + figure("ended", session.reason)
       + figure("struggling", worst ? `${worst} readings` : null)
+      + figure("parallel fetching", parallel ? `${parallel} readings` : null)
+      + figure("extra delay", delay ? `up to ${delay}s` : null)
       + `</div>`;
 
     if (rates.length > 1) {
