@@ -10,7 +10,7 @@ from typing import ClassVar
 
 from airplay_relay.fetch import Fetcher
 from airplay_relay.hls import StrippingPuller, pullable, variant_uris
-from airplay_relay.republish import START_SECONDS_BACK, Republisher
+from airplay_relay.republish import Republisher
 
 SEGMENT = b"\x47" + b"\x00" * 187
 
@@ -94,17 +94,6 @@ def test_the_puller_writes_every_segment_in_order(tmp_path) -> None:
     assert written == [2.0, 2.0, 2.0]
 
 
-def test_widening_starts_players_further_back_and_holds_more(tmp_path) -> None:
-    republisher = Republisher(tmp_path, "channel.m3u8", window=6)
-    republisher.widen(30)
-    for _ in range(12):
-        republisher.add(b"\x47" * 188, 6.0)
-
-    playlist = (tmp_path / "channel.m3u8").read_text()
-    assert f"TIME-OFFSET=-{START_SECONDS_BACK + 30:.3f}" in playlist
-    assert playlist.count("#EXTINF") == 11
-
-
 def test_a_large_segment_is_split_across_connections_and_reassembled() -> None:
     server, base = _serve()
     body = Fetcher().get_split(f"{base}/big.ts")
@@ -134,3 +123,60 @@ def test_only_live_unencrypted_playlists_are_pullable() -> None:
     assert pullable("#EXTM3U\n#EXTINF:2,\na.ts\n")
     assert not pullable("#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=k\n#EXTINF:2,\na.ts\n")
     assert not pullable("#EXTM3U\n#EXTINF:2,\na.ts\n#EXT-X-ENDLIST\n")
+
+
+def _listed(directory) -> int:
+    return (directory / "channel.m3u8").read_text().count("#EXTINF")
+
+
+def test_without_a_depth_segments_are_listed_at_once(tmp_path) -> None:
+    republisher = Republisher(tmp_path, "channel.m3u8", window=6)
+    republisher.add(b"\x47" * 188, 6.0, now=0.0)
+
+    assert _listed(tmp_path) == 1
+
+
+def test_a_burst_is_listed_evenly_and_a_short_gap_goes_unseen(tmp_path) -> None:
+    republisher = Republisher(tmp_path, "channel.m3u8", window=20)
+    republisher.widen(12)
+    for _ in range(5):
+        republisher.add(b"\x47" * 188, 6.0, now=0.0)
+
+    # Three to begin with, the rest held back.
+    assert _listed(tmp_path) == 3
+    assert republisher.reservoir == 12.0
+
+    republisher.release(now=6.0)
+    assert _listed(tmp_path) == 4
+    republisher.release(now=12.0)
+    assert _listed(tmp_path) == 5
+    assert not republisher.underruns
+
+
+def test_a_reservoir_that_runs_dry_is_recorded_once(tmp_path) -> None:
+    republisher = Republisher(tmp_path, "channel.m3u8", window=20)
+    republisher.widen(12)
+    for _ in range(5):
+        republisher.add(b"\x47" * 188, 6.0, now=0.0)
+    republisher.release(now=6.0)
+    republisher.release(now=12.0)
+    republisher.release(now=17.0)
+    assert not republisher.underruns
+
+    republisher.release(now=18.0)
+    republisher.release(now=19.0)
+    assert list(republisher.underruns) == [18.0]
+
+    # Late, the next segment is listed at once, and the schedule starts again from it.
+    republisher.add(b"\x47" * 188, 6.0, now=25.0)
+    assert _listed(tmp_path) == 6
+
+
+def test_a_slow_start_begins_anyway_after_the_wait(tmp_path) -> None:
+    republisher = Republisher(tmp_path, "channel.m3u8", window=20)
+    republisher.widen(30)
+    republisher.add(b"\x47" * 188, 6.0, now=0.0)
+    assert not (tmp_path / "channel.m3u8").exists()
+
+    republisher.release(now=21.0)
+    assert _listed(tmp_path) == 1

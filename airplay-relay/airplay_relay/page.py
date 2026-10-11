@@ -412,6 +412,9 @@ function showQuality(data) {
   const aids = [];
   if (data.fetching === "parallel") aids.push("fetching over parallel connections");
   if (data.extra_delay_seconds) aids.push(`+${data.extra_delay_seconds}s delay`);
+  const buffered = data.buffer_seconds
+    ? `${data.buffer_seconds}s buffer, ${data.reservoir_seconds || 0}s in hand` : null;
+  if (buffered) aids.unshift(buffered);
   help.textContent = data.playing && aids.length ? "Helping: " + aids.join(" · ") : "";
   help.hidden = !help.textContent;
 

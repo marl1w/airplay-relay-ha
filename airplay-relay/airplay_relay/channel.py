@@ -55,7 +55,9 @@ SAMPLE_SECONDS = 5
 SETTLED_SECONDS = 60
 # Extra delay granted to a struggling stream: a step at a time, up to a ceiling.
 CUSHION_STEP = 15.0
-CUSHION_MAX = 45.0
+CUSHION_MAX = 60.0
+# Seconds of media a smoothed feed holds back before any escalation.
+BASE_DEPTH = 20.0
 IDLE_MINUTES = 15
 WAKE_MINUTES = 60
 # 2026-01-01 UTC, so clock-based segment numbers stay small.
@@ -207,6 +209,7 @@ class Channel:
         self._republisher: Republisher | None = None
         self._puller: StrippingPuller | None = None
         self._cushion = 0.0
+        self._escalated_at = 0.0
         self._card: list[bytes] = []
         self._idler: asyncio.Task[None] | None = None
 
@@ -333,8 +336,8 @@ class Channel:
         if stall:
             return {
                 "state": "poor",
-                "because": f"segments are arriving up to {stall[0]:.0f}s apart against "
-                f"{stall[1]:.0f}s of video each; players run dry between them",
+                "because": f"the source went quiet for up to {stall[0]:.0f}s against "
+                f"{stall[1]:.0f}s of video per segment, and players ran dry",
                 "longest_wait": round(stall[0], 1),
             }
         keeping = self._pace.ratio(time.monotonic(), VERDICT_SECONDS)
@@ -361,20 +364,34 @@ class Channel:
 
     def _stall(self, clock: float) -> tuple[float, float] | None:
         """Return (longest wait, segment length) if players have been left waiting."""
-        wait = self._pace.longest_wait(clock, STALL_SECONDS)
-        if wait is None:
-            return None
         typical = max((seconds for _, seconds in status.published(self.directory)), default=0.0)
-        if typical <= 0 or wait <= typical * STALL_FACTOR:
+        wait = self._pace.longest_wait(clock, STALL_SECONDS)
+        republisher = self._republisher
+        if republisher is not None:
+            # Smoothed: only a dry reservoir reaches players, so only that counts.
+            floor = max(self._escalated_at, clock - STALL_SECONDS)
+            if typical <= 0 or not any(at > floor for at in republisher.underruns):
+                return None
+            return wait or 0.0, typical
+        if wait is None or typical <= 0 or wait <= typical * STALL_FACTOR:
             return None
         return wait, typical
 
     async def _gauge(self) -> None:
-        """Note the moment each new segment lands, which a five second sample would blur."""
+        """Note the moment each segment lands, and list the ones that are due."""
         playlist = self.directory / PLAYLIST
-        seen = None
+        seen: int | None = None
+        added = 0
         while True:
             await asyncio.sleep(0.5)
+            if (republisher := self._republisher) is not None:
+                republisher.release()
+                if republisher.added != added:
+                    if added:
+                        self._pace.arrived(time.monotonic())
+                    added = republisher.added
+                continue
+            added = 0
             try:
                 stamp = playlist.stat().st_mtime_ns
             except OSError:
@@ -506,6 +523,7 @@ class Channel:
         self._switching = False
         self._pace = Pace()
         self._cushion = 0.0
+        self._escalated_at = 0.0
         self._pulling = False
         self._started_at = None
         self._details = {}
@@ -670,6 +688,8 @@ class Channel:
             "quality": self.quality(),
             "fetching": self.fetching if self.requested else None,
             "extra_delay_seconds": round(self.extra_delay),
+            "buffer_seconds": round(self._republisher.depth) if self._republisher else None,
+            "reservoir_seconds": round(self._republisher.reservoir) if self._republisher else None,
             "session_id": self._session["id"] if self._session else None,
             "session_started": self._session["started"] if self._session else None,
             "samples": self._session["samples"][-240:] if self._session else [],
@@ -822,6 +842,7 @@ class Channel:
                 "the link is behind; fetching the segments over parallel connections now"
             )
             self._pulling = True
+            self._escalated_at = time.monotonic()
             self._puller.parallel = True
             self._pace.reset()
             return True
@@ -841,24 +862,25 @@ class Channel:
 
     def _apply_cushion(self) -> None:
         """Give the republishing pair the delay currently granted."""
+        depth = BASE_DEPTH + self._cushion
         if self._republisher is not None:
-            self._republisher.widen(self._cushion)
+            self._republisher.widen(depth)
         if self._puller is not None:
-            self._puller.lead = LEAD_SECONDS + self._cushion
+            # Room for the reservoir to fill, as well as for the usual lead.
+            self._puller.lead = LEAD_SECONDS + depth + 18.0
 
     def _widen(self, clock: float) -> bool:
         """Accept more delay before giving up quality. False if that is not possible."""
         if self._republisher is None or self._cushion >= CUSHION_MAX:
             return False
         self._cushion = min(CUSHION_MAX, self._cushion + CUSHION_STEP)
+        self._escalated_at = clock
         self._apply_cushion()
         # Judged afresh, so the extra delay gets time to show whether it was enough.
         self._pace.reset()
         _LOGGER.warning(
-            "the link is behind; players now start %.0fs further back and the feed may "
-            "run %.0fs ahead",
-            self._cushion,
-            self._cushion,
+            "the source ran late; the buffer is now %.0fs, which delays the picture by that much",
+            BASE_DEPTH + self._cushion,
         )
         return True
 
