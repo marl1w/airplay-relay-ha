@@ -197,7 +197,6 @@ class Channel:
         self._republisher: Republisher | None = None
         self._puller: StrippingPuller | None = None
         self._cushion = 0.0
-        self._cushion_changed = 0.0
         self._card: list[bytes] = []
         self._idler: asyncio.Task[None] | None = None
 
@@ -745,8 +744,6 @@ class Channel:
                 continue
 
             settled = self._pace.ratio(clock, STEADY_SECONDS)
-            if settled is not None and settled >= STEADY_RATIO and self._narrow(clock):
-                continue
             if settled is not None and settled >= STEADY_RATIO and ladder.up(clock):
                 await self._change_rendition(
                     f"kept up for {STEADY_SECONDS / 60:.0f} minutes, so there is room for more"
@@ -780,7 +777,6 @@ class Channel:
         if self._republisher is None or self._cushion >= CUSHION_MAX:
             return False
         self._cushion = min(CUSHION_MAX, self._cushion + CUSHION_STEP)
-        self._cushion_changed = clock
         self._apply_cushion()
         # Judged afresh, so the extra delay gets time to show whether it was enough.
         self._pace.reset()
@@ -790,16 +786,6 @@ class Channel:
             self._cushion,
             self._cushion,
         )
-        return True
-
-    def _narrow(self, clock: float) -> bool:
-        """Give back a step of delay once the stream has held steady for a while."""
-        if self._cushion <= 0 or clock - self._cushion_changed < STEADY_SECONDS:
-            return False
-        self._cushion = max(0.0, self._cushion - CUSHION_STEP)
-        self._cushion_changed = clock
-        self._apply_cushion()
-        _LOGGER.info("steady again; players start %.0fs further back than usual", self._cushion)
         return True
 
     def _remember(self) -> None:
