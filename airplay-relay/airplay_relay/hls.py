@@ -99,6 +99,25 @@ def variants(playlist: str) -> list[tuple[int, str, str]]:
     return found
 
 
+def variant_uris(playlist: str, base: str) -> list[str]:
+    """Return the playlist address of each rendition, in the order `variants` lists them."""
+    lines = [line.strip() for line in playlist.splitlines()]
+    found: list[str] = []
+    for position, line in enumerate(lines):
+        if not line.startswith("#EXT-X-STREAM-INF:"):
+            continue
+        target = next((text for text in lines[position + 1 :] if text and text[0] != "#"), "")
+        found.append(urljoin(base, target) if target else "")
+    return found
+
+
+def pullable(playlist: str) -> bool:
+    """Whether a media playlist is a live one of plain segments, which can be pulled directly."""
+    return "#EXTM3U" in playlist and not any(
+        tag in playlist for tag in ("#EXT-X-KEY", "#EXT-X-MAP", "#EXT-X-ENDLIST")
+    )
+
+
 def audio_renditions(playlist: str, group: str) -> list[tuple[str, str]]:
     """Return (language, name) for each rendition in one audio group, in playlist order."""
     found: list[tuple[str, str]] = []
@@ -141,6 +160,9 @@ class StrippingPuller:
     def _fetch(self, url: str) -> bytes:
         return self._fetcher.get(url)
 
+    def _fetch_segment(self, url: str) -> bytes:
+        return self._fetcher.get_split(url)
+
     async def run(self, write: Callable[[bytes, float, bool], object]) -> None:
         """Poll the playlist and pass each new segment to `write`, until cancelled."""
         loop = asyncio.get_running_loop()
@@ -172,7 +194,7 @@ class StrippingPuller:
 
             async def download(segment: str, gate: asyncio.Semaphore = gate) -> bytes:
                 async with gate:
-                    return await loop.run_in_executor(None, self._fetch, segment)
+                    return await loop.run_in_executor(None, self._fetch_segment, segment)
 
             downloads = [asyncio.ensure_future(download(segment)) for segment, _ in fresh]
             try:

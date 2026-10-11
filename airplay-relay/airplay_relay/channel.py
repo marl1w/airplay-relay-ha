@@ -17,7 +17,17 @@ from urllib.request import Request, urlopen
 
 from . import standby, status
 from .history import History
-from .hls import LEAD_SECONDS, StrippingPuller, audio_renditions, payload_offset, variants
+from .hls import (
+    LEAD_SECONDS,
+    PACKET,
+    SYNC,
+    StrippingPuller,
+    audio_renditions,
+    payload_offset,
+    pullable,
+    variant_uris,
+    variants,
+)
 from .logo import draw as draw_logo
 from .pacing import BEHIND_RATIO, BEHIND_SECONDS, STEADY_RATIO, STEADY_SECONDS, Ladder, Pace
 from .page import PAGE
@@ -169,6 +179,10 @@ class Channel:
         self.sender: dict[str, str] = {}
         self._sender_seen: float = 0.0
         self._needs_stripping = False
+        # Playlists, one per rendition, that the relay pulls itself rather than ffmpeg.
+        self._pull_urls: list[str] = []
+        # Whether ffmpeg has been replaced by the relay's own parallel fetching.
+        self._pulling = False
         self._variant: int | None = None
         self._languages: list[tuple[str, str]] = []
         self._ladder: Ladder | None = None
@@ -436,6 +450,7 @@ class Channel:
         self._switching = False
         self._pace = Pace()
         self._cushion = 0.0
+        self._pulling = False
         self._started_at = None
         self._details = {}
         if supervisor is not None:
@@ -486,6 +501,9 @@ class Channel:
                             ),
                         )
                     self._needs_stripping = False
+                    # Separate audio playlists need ffmpeg to mux them in.
+                    if not any(group for _, _, group in offered):
+                        self._consider_pulling(variant_uris(body, url), self._variant)
                     return
             segment = next(
                 (
@@ -512,6 +530,9 @@ class Channel:
                 )
                 if head[:1] == b"\x47":
                     _LOGGER.info("the segment is MPEG-TS, which is what we want")
+                    if pullable(body):
+                        self._pull_urls = [url]
+                        _LOGGER.info("plain MPEG-TS; parallel pulling is held in reserve")
                     return
                 if sample.lstrip()[:7] == b"#EXTM3U":
                     _LOGGER.info("the playlist points at other playlists; ffmpeg follows them")
@@ -533,6 +554,36 @@ class Channel:
                     )
         except Exception as error:
             _LOGGER.warning("could not inspect the source: %s", error)
+
+    def _consider_pulling(self, playlists: list[str], variant: int) -> None:
+        """Pull a master playlist's renditions here if its segments are plain MPEG-TS."""
+        if not playlists or not all(playlists):
+            return
+        try:
+            headers = {"User-Agent": self.user_agent} if self.user_agent else {}
+            with urlopen(Request(playlists[variant], headers=headers), timeout=10) as response:
+                media = response.read(65536).decode("utf-8", "replace")
+            segment = next(
+                (
+                    line.strip()
+                    for line in media.splitlines()
+                    if line.strip() and not line.startswith("#")
+                ),
+                None,
+            )
+            if segment is None or not pullable(media):
+                return
+            request = Request(urljoin(playlists[variant], segment), headers=headers)
+            with urlopen(request, timeout=15) as response:
+                head = response.read(PACKET + 1)
+        except Exception as error:
+            _LOGGER.info("not pulling the segments here: %s", error)
+            return
+        if len(head) > PACKET and head[0] == SYNC and head[PACKET] == SYNC:
+            self._pull_urls = playlists
+            _LOGGER.info(
+                "the segments are plain MPEG-TS; pulling them here over parallel connections"
+            )
 
     def snapshot(self) -> dict:
         """Return everything worth showing about the channel right now."""
@@ -681,8 +732,11 @@ class Channel:
                 continue
 
             behind = self._pace.ratio(clock, BEHIND_SECONDS)
-            if behind is not None and behind < BEHIND_RATIO and self._widen(clock):
-                continue
+            if behind is not None and behind < BEHIND_RATIO:
+                if await self._pull_in_parallel(behind):
+                    continue
+                if self._widen(clock):
+                    continue
             if behind is not None and behind < BEHIND_RATIO and ladder.down(clock):
                 await self._change_rendition(
                     f"published {behind:.0%} of real time over the last "
@@ -697,6 +751,22 @@ class Channel:
                 await self._change_rendition(
                     f"kept up for {STEADY_SECONDS / 60:.0f} minutes, so there is room for more"
                 )
+
+    async def _pull_in_parallel(self, behind: float) -> bool:
+        """Swap ffmpeg's single connection for parallel, split fetching. False if unavailable."""
+        if self._pulling or not self._pull_urls:
+            return False
+        _LOGGER.warning(
+            "published %.0f%% of real time over the last %.0fs; fetching the segments over "
+            "parallel connections instead of ffmpeg's one",
+            behind * 100,
+            BEHIND_SECONDS,
+        )
+        self._pulling = True
+        self._pace.reset()
+        self._switching = True
+        await self._kill()
+        return True
 
     def _apply_cushion(self) -> None:
         """Give the republishing pair the delay currently granted."""
@@ -785,6 +855,8 @@ class Channel:
         _LOGGER.info("pulling %s", url)
         self._is_hls = self._looks_like_hls(url)
         self._needs_stripping = False
+        self._pull_urls = []
+        self._pulling = False
         await asyncio.get_running_loop().run_in_executor(None, self._inspect, url)
         attempt = 0
         while True:
@@ -817,7 +889,7 @@ class Channel:
 
     async def _attempt(self, url: str) -> int | None:
         """Run ffmpeg once and return its exit code."""
-        if self._needs_stripping:
+        if self._needs_stripping or (self._pulling and self._pull_urls):
             return await self._attempt_stripped(url)
         return await self._attempt_direct(url)
 
@@ -826,6 +898,9 @@ class Channel:
         republisher = Republisher(
             self.directory, PLAYLIST, self.hls_list_size, start=self._numbering_starts_at()
         )
+        if self._pulling and self._pull_urls:
+            at = self._variant if self._variant is not None and len(self._pull_urls) > 1 else 0
+            url = self._pull_urls[at]
         puller = StrippingPuller(url, self.user_agent)
         self._republisher, self._puller = republisher, puller
         self._apply_cushion()

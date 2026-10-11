@@ -9,7 +9,7 @@ import threading
 from typing import ClassVar
 
 from airplay_relay.fetch import Fetcher
-from airplay_relay.hls import StrippingPuller
+from airplay_relay.hls import StrippingPuller, pullable, variant_uris
 from airplay_relay.republish import START_SECONDS_BACK, Republisher
 
 SEGMENT = b"\x47" + b"\x00" * 187
@@ -28,6 +28,17 @@ class _Handler(BaseHTTPRequestHandler):
             self.end_headers()
             return
         body = SEGMENT * 8
+        if self.path.startswith("/big"):
+            body = bytes(range(256)) * 8192
+            if ranged := self.headers.get("Range"):
+                start, end = (int(n) for n in ranged.removeprefix("bytes=").split("-"))
+                chunk = body[start : end + 1]
+                self.send_response(206)
+                self.send_header("Content-Range", f"bytes {start}-{end}/{len(body)}")
+                self.send_header("Content-Length", str(len(chunk)))
+                self.end_headers()
+                self.wfile.write(chunk)
+                return
         if self.path.endswith(".m3u8"):
             body = (
                 b"#EXTM3U\n#EXT-X-TARGETDURATION:2\n"
@@ -92,3 +103,34 @@ def test_widening_starts_players_further_back_and_holds_more(tmp_path) -> None:
     playlist = (tmp_path / "channel.m3u8").read_text()
     assert f"TIME-OFFSET=-{START_SECONDS_BACK + 30:.3f}" in playlist
     assert playlist.count("#EXTINF") == 11
+
+
+def test_a_large_segment_is_split_across_connections_and_reassembled() -> None:
+    server, base = _serve()
+    body = Fetcher().get_split(f"{base}/big.ts")
+    server.shutdown()
+    assert body == bytes(range(256)) * 8192
+    assert len(_Handler.connections) > 1
+
+
+def test_a_server_without_ranges_still_serves_the_whole_segment() -> None:
+    server, base = _serve()
+    assert Fetcher().get_split(f"{base}/a.ts") == SEGMENT * 8
+    server.shutdown()
+
+
+def test_variant_uris_follow_the_order_of_the_variants() -> None:
+    master = (
+        "#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=1000,RESOLUTION=640x360\nlow/index.m3u8\n"
+        "#EXT-X-STREAM-INF:BANDWIDTH=3000,RESOLUTION=1280x720\nhigh/index.m3u8\n"
+    )
+    assert variant_uris(master, "http://h/a/master.m3u8") == [
+        "http://h/a/low/index.m3u8",
+        "http://h/a/high/index.m3u8",
+    ]
+
+
+def test_only_live_unencrypted_playlists_are_pullable() -> None:
+    assert pullable("#EXTM3U\n#EXTINF:2,\na.ts\n")
+    assert not pullable("#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=k\n#EXTINF:2,\na.ts\n")
+    assert not pullable("#EXTM3U\n#EXTINF:2,\na.ts\n#EXT-X-ENDLIST\n")
