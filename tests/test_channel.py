@@ -238,3 +238,29 @@ def test_the_snapshot_says_how_the_stream_is_fetched(tmp_path) -> None:
     channel._cushion = 30.0
     assert channel.fetching == "parallel"
     assert channel.snapshot()["extra_delay_seconds"] == 30
+
+
+def test_a_player_slower_than_the_stream_is_reported(tmp_path) -> None:
+    channel = Channel(str(tmp_path), 0, 2, 6)
+    now = time.monotonic()
+    channel.note_transfer("10.0.0.5", 6_000_000, 12.0, True)
+    channel.note_transfer("10.0.0.6", 6_000_000, 2.0, True)
+
+    peer, rate, dropped = channel.slow_player(now + 1, 8000)
+    assert peer == "10.0.0.5"
+    assert round(rate) == 4000
+    assert not dropped
+
+
+def test_a_dropped_download_is_reported_even_when_fast(tmp_path) -> None:
+    channel = Channel(str(tmp_path), 0, 2, 6)
+    channel.note_transfer("10.0.0.5", 3_000_000, 0.5, False)
+
+    assert channel.slow_player(time.monotonic() + 1, 8000)[2] is True
+
+
+def test_healthy_players_raise_no_alarm(tmp_path) -> None:
+    channel = Channel(str(tmp_path), 0, 2, 6)
+    channel.note_transfer("10.0.0.5", 6_000_000, 1.0, True)
+
+    assert channel.slow_player(time.monotonic() + 1, 8000) is None

@@ -150,7 +150,7 @@ class StrippingPuller:
         self.url = url
         self.user_agent = user_agent
         self.lead = LEAD_SECONDS
-        # Off until the plain, one-at-a-time fetching proves too slow.
+        # Plain, one-at-a-time fetching unless told otherwise.
         self.parallel = False
         self._fetcher = Fetcher(user_agent)
         self.segments = 0

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 import contextlib
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -51,6 +52,8 @@ LOGO = "logo.png"
 RETRY_DELAYS = (1, 2, 4, 8, 15, 30)
 WATCHING_SECONDS = 30
 VERDICT_SECONDS = 20.0
+# How far back a slow or dropped download still counts against the stream.
+PLAYER_SECONDS = 45.0
 SAMPLE_SECONDS = 5
 SETTLED_SECONDS = 60
 # Extra delay granted to a struggling stream: a step at a time, up to a ceiling.
@@ -93,6 +96,21 @@ class _Handler(SimpleHTTPRequestHandler):
 
     def log_message(self, format: str, *args) -> None:
         """Keep segment and status-page requests out of the add-on log."""
+
+    def copyfile(self, source, outputfile) -> None:
+        """Send the file, timing it, as a slow or dropped download means a struggling player."""
+        began = time.monotonic()
+        sent = 0
+        complete = True
+        try:
+            while chunk := source.read(65536):
+                outputfile.write(chunk)
+                sent += len(chunk)
+        except (OSError, ValueError):
+            complete = False
+        if self.path.split("?")[0].endswith(".ts"):
+            peer = self.client_address[0] if self.client_address else ""
+            self.channel.note_transfer(peer, sent, time.monotonic() - began, complete)
 
     def do_GET(self) -> None:
         """Answer the status endpoints, and otherwise serve the directory."""
@@ -210,6 +228,7 @@ class Channel:
         self._puller: StrippingPuller | None = None
         self._cushion = 0.0
         self._escalated_at = 0.0
+        self._transfers: deque[tuple[float, str, int, float, bool]] = deque(maxlen=200)
         self._card: list[bytes] = []
         self._idler: asyncio.Task[None] | None = None
 
@@ -332,7 +351,24 @@ class Channel:
         """Say in a word how the stream is going, and why."""
         if not self.playing:
             return {"state": "idle", "because": "nothing is playing"}
-        stall = self._stall(time.monotonic())
+        clock = time.monotonic()
+        _, seconds, size = status.window(self.directory)
+        bitrate = size * 8 / seconds / 1000 if seconds > 0 else None
+        if slow := self.slow_player(clock, bitrate):
+            peer, rate, dropped = slow
+            what = (
+                "dropped a download part-way"
+                if dropped
+                else f"is downloading at {rate / 1000:.1f} Mbit/s, below the stream's "
+                f"{(bitrate or 0) / 1000:.1f}"
+            )
+            return {
+                "state": "poor",
+                "because": f"the player at {peer} {what}; the link to it is the limit",
+                "player": peer,
+                "player_kbps": round(rate),
+            }
+        stall = self._stall(clock)
         if stall:
             return {
                 "state": "poor",
@@ -342,6 +378,16 @@ class Channel:
             }
         keeping = self._pace.ratio(time.monotonic(), VERDICT_SECONDS)
         stepped = self._ladder.rung if self._ladder else 0
+        republisher = self._republisher
+        if republisher is not None and keeping is not None and keeping >= BEHIND_RATIO:
+            held = republisher.reservoir
+            if republisher.depth and held < republisher.depth / 2:
+                return {
+                    "state": "fair",
+                    "because": f"only {held:.0f}s in hand of the {republisher.depth:.0f}s buffer; "
+                    "the source is not running ahead, so a late segment would stall players",
+                    "keeping_up": round(keeping, 3),
+                }
         if keeping is None:
             return {"state": "starting", "because": "not enough of the stream has arrived to judge"}
         if keeping < BEHIND_RATIO:
@@ -444,6 +490,27 @@ class Channel:
         self._last_viewer = time.monotonic()
         if peer:
             self._viewers[peer] = self._last_viewer
+
+    def note_transfer(self, peer: str, size: int, seconds: float, complete: bool) -> None:
+        """Record how a segment went to a player: how much, how fast, and whether it finished."""
+        self._transfers.append((time.monotonic(), peer, size, seconds, complete))
+
+    def slow_player(
+        self, clock: float, bitrate_kbps: float | None
+    ) -> tuple[str, float, bool] | None:
+        """Return (player, its rate in kbps, dropped) if a player cannot take the stream in time."""
+        if not bitrate_kbps:
+            return None
+        worst: tuple[str, float, bool] | None = None
+        for at, peer, size, seconds, complete in self._transfers:
+            if clock - at > PLAYER_SECONDS or size < 200_000:
+                continue
+            rate = size * 8 / max(seconds, 0.001) / 1000
+            if complete and rate >= bitrate_kbps:
+                continue
+            if worst is None or rate < worst[1]:
+                worst = (peer, rate, not complete)
+        return worst
 
     @property
     def viewers(self) -> int:
@@ -986,7 +1053,9 @@ class Channel:
             at = self._variant if self._variant is not None and len(self._pull_urls) > 1 else 0
             url = self._pull_urls[at]
         puller = StrippingPuller(url, self.user_agent)
-        puller.parallel = self._pulling
+        # Always parallel: one connection cannot fetch the stream ahead of real time,
+        # and without running ahead the buffer never fills.
+        self._pulling = puller.parallel = True
         self._republisher, self._puller = republisher, puller
         self._apply_cushion()
         _LOGGER.info("republishing the source's own segments, unchanged")
