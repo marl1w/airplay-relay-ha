@@ -44,6 +44,10 @@ class Fetcher:
         if connection := pool.pop((scheme, host), None):
             connection.close()
 
+    def get_plain(self, url: str) -> bytes:
+        """Fetch over a connection of its own, as a browser would."""
+        return self._plain(url)
+
     def _plain(self, url: str) -> bytes:
         """Fetch with a connection of its own, which follows redirects."""
         headers = {"User-Agent": self.user_agent} if self.user_agent else {}

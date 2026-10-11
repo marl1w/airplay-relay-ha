@@ -387,7 +387,9 @@ class Channel:
     @property
     def fetching(self) -> str:
         """How the source is being fetched: by ffmpeg, or in parallel by the relay."""
-        return "parallel" if self._pulling or self._needs_stripping else "ffmpeg"
+        if self._pulling:
+            return "parallel"
+        return "relay" if self._needs_stripping else "ffmpeg"
 
     @property
     def extra_delay(self) -> float:
@@ -813,7 +815,17 @@ class Channel:
 
     async def _pull_in_parallel(self, behind: float) -> bool:
         """Swap ffmpeg's single connection for parallel, split fetching. False if unavailable."""
-        if self._pulling or not self._pull_urls:
+        if self._pulling:
+            return False
+        if self._needs_stripping and self._puller is not None:
+            _LOGGER.warning(
+                "the link is behind; fetching the segments over parallel connections now"
+            )
+            self._pulling = True
+            self._puller.parallel = True
+            self._pace.reset()
+            return True
+        if not self._pull_urls:
             return False
         _LOGGER.warning(
             "published %.0f%% of real time over the last %.0fs; fetching the segments over "
@@ -952,6 +964,7 @@ class Channel:
             at = self._variant if self._variant is not None and len(self._pull_urls) > 1 else 0
             url = self._pull_urls[at]
         puller = StrippingPuller(url, self.user_agent)
+        puller.parallel = self._pulling
         self._republisher, self._puller = republisher, puller
         self._apply_cushion()
         _LOGGER.info("republishing the source's own segments, unchanged")

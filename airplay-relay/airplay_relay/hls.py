@@ -21,7 +21,7 @@ CONFIRM = 8
 REMEMBER = 256
 
 # Maximum seconds the feed may run ahead of real time.
-LEAD_SECONDS = 20.0
+LEAD_SECONDS = 12.0
 
 # Segments fetched at once, so one slow transfer does not hold up the rest.
 PARALLEL = 3
@@ -150,6 +150,8 @@ class StrippingPuller:
         self.url = url
         self.user_agent = user_agent
         self.lead = LEAD_SECONDS
+        # Off until the plain, one-at-a-time fetching proves too slow.
+        self.parallel = False
         self._fetcher = Fetcher(user_agent)
         self.segments = 0
         self.stripped_bytes = 0
@@ -158,10 +160,14 @@ class StrippingPuller:
         self._started = 0.0
 
     def _fetch(self, url: str) -> bytes:
-        return self._fetcher.get(url)
+        if self.parallel:
+            return self._fetcher.get(url)
+        return self._fetcher.get_plain(url)
 
     def _fetch_segment(self, url: str) -> bytes:
-        return self._fetcher.get_split(url)
+        if self.parallel:
+            return self._fetcher.get_split(url)
+        return self._fetcher.get_plain(url)
 
     async def run(self, write: Callable[[bytes, float, bool], object]) -> None:
         """Pass each new segment to `write` in order, until cancelled.
@@ -171,10 +177,11 @@ class StrippingPuller:
         """
         loop = asyncio.get_running_loop()
         queue: asyncio.Queue[tuple[asyncio.Future[bytes], float]] = asyncio.Queue()
-        gate = asyncio.Semaphore(PARALLEL)
+        one_at_a_time = asyncio.Semaphore(1)
+        several = asyncio.Semaphore(PARALLEL)
 
         async def download(segment: str) -> bytes:
-            async with gate:
+            async with several if self.parallel else one_at_a_time:
                 return await loop.run_in_executor(None, self._fetch_segment, segment)
 
         async def poll() -> None:
