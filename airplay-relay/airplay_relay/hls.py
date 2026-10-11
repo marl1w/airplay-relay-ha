@@ -21,7 +21,7 @@ CONFIRM = 8
 REMEMBER = 256
 
 # Maximum seconds the feed may run ahead of real time.
-LEAD_SECONDS = 12.0
+LEAD_SECONDS = 20.0
 
 # Segments fetched at once, so one slow transfer does not hold up the rest.
 PARALLEL = 3
@@ -164,67 +164,73 @@ class StrippingPuller:
         return self._fetcher.get_split(url)
 
     async def run(self, write: Callable[[bytes, float, bool], object]) -> None:
-        """Poll the playlist and pass each new segment to `write`, until cancelled."""
+        """Pass each new segment to `write` in order, until cancelled.
+
+        Polling and downloading go on side by side, so a slow segment never delays
+        the discovery of the next, and several transfers share the link at once.
+        """
         loop = asyncio.get_running_loop()
-        wait = 4.0
-        missed = False
-        while True:
-            try:
-                raw = await loop.run_in_executor(None, self._fetch, self.url)
-            except Exception as error:
-                _LOGGER.warning("playlist fetch failed: %s", error)
-                await asyncio.sleep(wait)
-                continue
+        queue: asyncio.Queue[tuple[asyncio.Future[bytes], float]] = asyncio.Queue()
+        gate = asyncio.Semaphore(PARALLEL)
 
-            playlist = raw.decode("utf-8", "replace")
-            wait = target_duration(playlist) / 2
-            # Keyed on the path because the query string can change on every poll.
-            fresh = [
-                (url, seconds)
-                for url, seconds in parse(playlist, self.url)
-                if url.split("?")[0] not in self._seen
-            ]
+        async def download(segment: str) -> bytes:
+            async with gate:
+                return await loop.run_in_executor(None, self._fetch_segment, segment)
 
-            for segment, _ in fresh:
-                self._seen.append(segment.split("?")[0])
-            del self._seen[:-REMEMBER]
+        async def poll() -> None:
+            wait = 4.0
+            while True:
+                began = loop.time()
+                try:
+                    raw = await loop.run_in_executor(None, self._fetch, self.url)
+                except Exception as error:
+                    _LOGGER.warning("playlist fetch failed: %s", error)
+                    await asyncio.sleep(wait)
+                    continue
 
-            # All started now, up to PARALLEL at a time, but written in playlist order.
-            gate = asyncio.Semaphore(PARALLEL)
-
-            async def download(segment: str, gate: asyncio.Semaphore = gate) -> bytes:
-                async with gate:
-                    return await loop.run_in_executor(None, self._fetch_segment, segment)
-
-            downloads = [asyncio.ensure_future(download(segment)) for segment, _ in fresh]
-            try:
-                for (_segment, seconds), download_task in zip(fresh, downloads, strict=True):
-                    try:
-                        data = await download_task
-                    except Exception as error:
-                        _LOGGER.warning("segment fetch failed: %s", error)
-                        missed = True
+                playlist = raw.decode("utf-8", "replace")
+                wait = target_duration(playlist) / 3
+                # Keyed on the path because the query string can change on every poll.
+                for segment, seconds in parse(playlist, self.url):
+                    key = segment.split("?")[0]
+                    if key in self._seen:
                         continue
+                    self._seen.append(key)
+                    del self._seen[:-REMEMBER]
+                    queue.put_nowait((asyncio.ensure_future(download(segment)), seconds))
+                # The wait counts from the start of the poll, not from its end.
+                await asyncio.sleep(max(0.5, wait - (loop.time() - began)))
 
-                    offset = payload_offset(data)
-                    if offset and self.segments == 0:
-                        _LOGGER.info("stripping %d bytes of prefix from each segment", offset)
-                    self.segments += 1
-                    self.stripped_bytes += offset
-                    if not self._started:
-                        self._started = loop.time()
-                    result = write(data[offset:], seconds, missed)
-                    if asyncio.iscoroutine(result):
-                        await result
-                    missed = False
+        poller = asyncio.ensure_future(poll())
+        missed = False
+        try:
+            while True:
+                download_task, seconds = await queue.get()
+                try:
+                    data = await download_task
+                except Exception as error:
+                    _LOGGER.warning("segment fetch failed: %s", error)
+                    missed = True
+                    continue
 
-                    # Hold the feed near real time so the live window does not outrun players.
-                    self._written += seconds
-                    ahead = self._written - (loop.time() - self._started)
-                    if ahead > self.lead:
-                        await asyncio.sleep(ahead - self.lead)
-            finally:
-                for download_task in downloads:
-                    download_task.cancel()
+                offset = payload_offset(data)
+                if offset and self.segments == 0:
+                    _LOGGER.info("stripping %d bytes of prefix from each segment", offset)
+                self.segments += 1
+                self.stripped_bytes += offset
+                if not self._started:
+                    self._started = loop.time()
+                result = write(data[offset:], seconds, missed)
+                if asyncio.iscoroutine(result):
+                    await result
+                missed = False
 
-            await asyncio.sleep(wait)
+                # Hold the feed near real time so the live window does not outrun players.
+                self._written += seconds
+                ahead = self._written - (loop.time() - self._started)
+                if ahead > self.lead:
+                    await asyncio.sleep(ahead - self.lead)
+        finally:
+            poller.cancel()
+            while not queue.empty():
+                queue.get_nowait()[0].cancel()

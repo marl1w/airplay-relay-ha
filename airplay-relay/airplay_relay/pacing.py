@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import deque
+from itertools import pairwise
 
 # Below 1.0 because segments arrive in lumps of a few seconds.
 BEHIND_RATIO = 0.9
@@ -11,6 +12,10 @@ BEHIND_SECONDS = 45.0
 # Stricter than dropping so the ladder does not oscillate between renditions.
 STEADY_RATIO = 0.99
 STEADY_SECONDS = 300.0
+
+# A segment later than this many times its own length leaves players with nothing to play.
+STALL_FACTOR = 1.5
+STALL_SECONDS = 45.0
 
 BARRED_SECONDS = 600.0
 
@@ -28,6 +33,7 @@ class Pace:
         self._known: set[str] = set()
         self._produced = 0.0
         self._samples: deque[tuple[float, float]] = deque()
+        self._arrivals: deque[float] = deque(maxlen=REMEMBER)
 
     def note(self, clock: float, entries: list[tuple[str, float]]) -> None:
         """Record segments not seen before, by name, as the window length is fixed."""
@@ -44,6 +50,19 @@ class Pace:
         while len(self._samples) > 1 and clock - self._samples[0][0] > HISTORY_SECONDS:
             self._samples.popleft()
 
+    def arrived(self, clock: float) -> None:
+        """Record that a new segment has just been published."""
+        self._arrivals.append(clock)
+
+    def longest_wait(self, clock: float, over: float) -> float | None:
+        """Return the longest time players went without a new segment, or None if unknown."""
+        recent = [at for at in self._arrivals if clock - at <= over]
+        if len(recent) < 2:
+            return None
+        waits = [later - earlier for earlier, later in pairwise(recent)]
+        # Still waiting counts, so a stall is seen while it happens, not after.
+        return max(*waits, clock - recent[-1])
+
     def ratio(self, clock: float, over: float) -> float | None:
         """Return media produced per second of real time, or None if too early."""
         oldest = next((sample for sample in self._samples if clock - sample[0] >= over), None)
@@ -57,6 +76,7 @@ class Pace:
     def reset(self) -> None:
         """Forget the pacing history so a new rendition is judged on its own."""
         self._samples.clear()
+        self._arrivals.clear()
 
 
 class Ladder:

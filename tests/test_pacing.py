@@ -82,3 +82,24 @@ def test_the_bar_follows_the_rendition_that_failed_most_recently() -> None:
     assert not ladder.up(BARRED_SECONDS / 2)
     assert ladder.up(BARRED_SECONDS + 1)
     assert ladder.name == "1280x720"
+
+
+def test_a_long_gap_between_segments_is_a_stall_even_when_the_average_is_fine() -> None:
+    from airplay_relay.pacing import Pace
+
+    pace = Pace()
+    for at in (0.0, 6.0, 12.0, 27.0, 33.0, 39.0):
+        pace.arrived(at)
+
+    assert pace.longest_wait(40.0, 45.0) == 15.0
+
+
+def test_waiting_now_counts_before_the_segment_lands() -> None:
+    from airplay_relay.pacing import Pace
+
+    pace = Pace()
+    for at in (0.0, 6.0, 12.0):
+        pace.arrived(at)
+
+    assert pace.longest_wait(30.0, 45.0) == 18.0
+    assert pace.longest_wait(13.0, 45.0) == 6.0

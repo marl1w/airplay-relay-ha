@@ -29,7 +29,16 @@ from .hls import (
     variants,
 )
 from .logo import draw as draw_logo
-from .pacing import BEHIND_RATIO, BEHIND_SECONDS, STEADY_RATIO, STEADY_SECONDS, Ladder, Pace
+from .pacing import (
+    BEHIND_RATIO,
+    BEHIND_SECONDS,
+    STALL_FACTOR,
+    STALL_SECONDS,
+    STEADY_RATIO,
+    STEADY_SECONDS,
+    Ladder,
+    Pace,
+)
 from .page import PAGE
 from .republish import Republisher
 
@@ -188,6 +197,7 @@ class Channel:
         self._ladder: Ladder | None = None
         self._pace = Pace()
         self._adapter: asyncio.Task[None] | None = None
+        self._gauger: asyncio.Task[None] | None = None
         self._watcher: asyncio.Task[None] | None = None
         self._stopping: asyncio.Task[None] | None = None
         # The stream stopped for want of viewers, and when, so a player can wake it.
@@ -283,6 +293,7 @@ class Channel:
         self._supervisor = asyncio.create_task(self._supervise(url))
         self._describer = asyncio.create_task(self._describe())
         self._adapter = asyncio.create_task(self._adapt())
+        self._gauger = asyncio.create_task(self._gauge())
         self._watcher = asyncio.create_task(self._watch())
 
     async def pause(self) -> None:
@@ -318,6 +329,14 @@ class Channel:
         """Say in a word how the stream is going, and why."""
         if not self.playing:
             return {"state": "idle", "because": "nothing is playing"}
+        stall = self._stall(time.monotonic())
+        if stall:
+            return {
+                "state": "poor",
+                "because": f"segments are arriving up to {stall[0]:.0f}s apart against "
+                f"{stall[1]:.0f}s of video each; players run dry between them",
+                "longest_wait": round(stall[0], 1),
+            }
         keeping = self._pace.ratio(time.monotonic(), VERDICT_SECONDS)
         stepped = self._ladder.rung if self._ladder else 0
         if keeping is None:
@@ -339,6 +358,31 @@ class Channel:
             "because": "keeping up with the source at its best rendition",
             "keeping_up": round(keeping, 3),
         }
+
+    def _stall(self, clock: float) -> tuple[float, float] | None:
+        """Return (longest wait, segment length) if players have been left waiting."""
+        wait = self._pace.longest_wait(clock, STALL_SECONDS)
+        if wait is None:
+            return None
+        typical = max((seconds for _, seconds in status.published(self.directory)), default=0.0)
+        if typical <= 0 or wait <= typical * STALL_FACTOR:
+            return None
+        return wait, typical
+
+    async def _gauge(self) -> None:
+        """Note the moment each new segment lands, which a five second sample would blur."""
+        playlist = self.directory / PLAYLIST
+        seen = None
+        while True:
+            await asyncio.sleep(0.5)
+            try:
+                stamp = playlist.stat().st_mtime_ns
+            except OSError:
+                continue
+            if stamp != seen:
+                if seen is not None:
+                    self._pace.arrived(time.monotonic())
+                seen = stamp
 
     @property
     def fetching(self) -> str:
@@ -452,8 +496,9 @@ class Channel:
         supervisor, self._supervisor = self._supervisor, None
         describer, self._describer = self._describer, None
         adapter, self._adapter = self._adapter, None
+        gauger, self._gauger = self._gauger, None
         watcher, self._watcher = self._watcher, None
-        for task in (describer, adapter, watcher):
+        for task in (describer, adapter, gauger, watcher):
             if task is not None:
                 task.cancel()
         self._switching = False
@@ -739,16 +784,21 @@ class Channel:
 
             # Sampled before the ladder check, so single-rendition streams are measured too.
             ladder = self._ladder
-            if ladder is None:
-                continue
 
             behind = self._pace.ratio(clock, BEHIND_SECONDS)
+            stall = self._stall(clock)
+            if stall and (behind is None or behind >= BEHIND_RATIO):
+                # Right on average, yet players were left waiting: treat it as behind.
+                _LOGGER.warning(
+                    "segments arrived up to %.0fs apart against %.0fs of video each", *stall
+                )
+                behind = BEHIND_RATIO - 0.01
             if behind is not None and behind < BEHIND_RATIO:
                 if await self._pull_in_parallel(behind):
                     continue
                 if self._widen(clock):
                     continue
-            if behind is not None and behind < BEHIND_RATIO and ladder.down(clock):
+            if behind is not None and behind < BEHIND_RATIO and ladder and ladder.down(clock):
                 await self._change_rendition(
                     f"published {behind:.0%} of real time over the last "
                     f"{BEHIND_SECONDS:.0f}s, which the link cannot sustain"
@@ -756,7 +806,7 @@ class Channel:
                 continue
 
             settled = self._pace.ratio(clock, STEADY_SECONDS)
-            if settled is not None and settled >= STEADY_RATIO and ladder.up(clock):
+            if settled is not None and settled >= STEADY_RATIO and ladder and ladder.up(clock):
                 await self._change_rendition(
                     f"kept up for {STEADY_SECONDS / 60:.0f} minutes, so there is room for more"
                 )
