@@ -240,16 +240,11 @@ def test_the_snapshot_says_how_the_stream_is_fetched(tmp_path) -> None:
     assert channel.snapshot()["extra_delay_seconds"] == 30
 
 
-def test_a_player_slower_than_the_stream_is_reported(tmp_path) -> None:
+def test_a_slow_read_alone_raises_no_alarm(tmp_path) -> None:
     channel = Channel(str(tmp_path), 0, 2, 6)
-    now = time.monotonic()
     channel.note_transfer("10.0.0.5", 6_000_000, 12.0, True)
-    channel.note_transfer("10.0.0.6", 6_000_000, 2.0, True)
 
-    peer, rate, dropped = channel.slow_player(now + 1, 8000)
-    assert peer == "10.0.0.5"
-    assert round(rate) == 4000
-    assert not dropped
+    assert channel.slow_player(time.monotonic() + 1, 8000) is None
 
 
 def test_a_dropped_download_is_reported_even_when_fast(tmp_path) -> None:

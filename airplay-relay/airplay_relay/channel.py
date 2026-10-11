@@ -356,15 +356,9 @@ class Channel:
         bitrate = size * 8 / seconds / 1000 if seconds > 0 else None
         if slow := self.slow_player(clock, bitrate):
             peer, rate, dropped = slow
-            what = (
-                "dropped a download part-way"
-                if dropped
-                else f"is downloading at {rate / 1000:.1f} Mbit/s, below the stream's "
-                f"{(bitrate or 0) / 1000:.1f}"
-            )
             return {
                 "state": "poor",
-                "because": f"the player at {peer} {what}; the link to it is the limit",
+                "because": f"the player at {peer} dropped a download part-way",
                 "player": peer,
                 "player_kbps": round(rate),
             }
@@ -494,6 +488,14 @@ class Channel:
     def note_transfer(self, peer: str, size: int, seconds: float, complete: bool) -> None:
         """Record how a segment went to a player: how much, how fast, and whether it finished."""
         self._transfers.append((time.monotonic(), peer, size, seconds, complete))
+        _LOGGER.info(
+            "sent %.1fMB to %s in %.1fs (%.1f Mbit/s)%s",
+            size / 1e6,
+            peer,
+            seconds,
+            size * 8 / max(seconds, 0.001) / 1e6,
+            "" if complete else " -- the player dropped it",
+        )
 
     def slow_player(
         self, clock: float, bitrate_kbps: float | None
@@ -506,7 +508,8 @@ class Channel:
             if clock - at > PLAYER_SECONDS or size < 200_000:
                 continue
             rate = size * 8 / max(seconds, 0.001) / 1000
-            if complete and rate >= bitrate_kbps:
+            # A slow read alone proves nothing: players with a full buffer read slowly.
+            if complete:
                 continue
             if worst is None or rate < worst[1]:
                 worst = (peer, rate, not complete)
