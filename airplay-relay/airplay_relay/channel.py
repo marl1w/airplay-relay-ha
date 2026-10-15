@@ -355,14 +355,6 @@ class Channel:
         if not self.playing:
             return {"state": "idle", "because": "nothing is playing"}
         clock = time.monotonic()
-        if starved := self._starved_of_cpu():
-            return {
-                "state": "poor",
-                "because": f"the box is short of CPU ({starved[0]:.0f}% of the last 10s spent "
-                "waiting for it); something else on this Home Assistant is competing, "
-                "so segments arrive and leave late",
-                "cpu_pressure": starved[0],
-            }
         _, seconds, size = status.window(self.directory)
         bitrate = size * 8 / seconds / 1000 if seconds > 0 else None
         if slow := self.slow_player(clock, bitrate):
@@ -375,32 +367,32 @@ class Channel:
             }
         stall = self._stall(clock)
         if stall:
-            return {
+            return self._late({
                 "state": "poor",
                 "because": f"the source went quiet for up to {stall[0]:.0f}s against "
                 f"{stall[1]:.0f}s of video per segment, and players ran dry",
                 "longest_wait": round(stall[0], 1),
-            }
+            })
         keeping = self._pace.ratio(time.monotonic(), VERDICT_SECONDS)
         stepped = self._ladder.rung if self._ladder else 0
         republisher = self._republisher
         if republisher is not None and keeping is not None and keeping >= BEHIND_RATIO:
             held = republisher.reservoir
             if republisher.depth and held < republisher.depth / 2:
-                return {
+                return self._late({
                     "state": "fair",
                     "because": f"only {held:.0f}s in hand of the {republisher.depth:.0f}s buffer; "
                     "the source is not running ahead, so a late segment would stall players",
                     "keeping_up": round(keeping, 3),
-                }
+                })
         if keeping is None:
             return {"state": "starting", "because": "not enough of the stream has arrived to judge"}
         if keeping < BEHIND_RATIO:
-            return {
+            return self._late({
                 "state": "poor",
                 "because": f"the window is gaining {keeping:.0%} of real time; the link is behind",
                 "keeping_up": round(keeping, 3),
-            }
+            })
         if stepped:
             return {
                 "state": "fair",
@@ -495,6 +487,21 @@ class Channel:
         self._last_viewer = time.monotonic()
         if peer:
             self._viewers[peer] = self._last_viewer
+
+    def _late(self, verdict: dict[str, object]) -> dict[str, object]:
+        """Name CPU starvation as the likely cause of a stream that is really late.
+
+        Pressure alone is no verdict: on a box with many small bursty processes a task often waits
+        a moment for a core while most of the CPU is idle, so it only explains lateness seen in the
+        stream itself.
+        """
+        if starved := self._starved_of_cpu():
+            verdict["because"] = (
+                f"{verdict['because']}; the box is also short of CPU ({starved[0]:.0f}% of the "
+                "last 10s spent waiting for it), which likely delays segments"
+            )
+            verdict["cpu_pressure"] = starved[0]
+        return verdict
 
     @staticmethod
     def _starved_of_cpu() -> tuple[float, float] | None:

@@ -271,3 +271,36 @@ def test_a_cpu_starved_box_is_named_as_the_cause(tmp_path, monkeypatch) -> None:
 
     monkeypatch.setattr(channel_module.status, "cpu_pressure", lambda: None)
     assert channel._starved_of_cpu() is None
+
+
+def _judged(tmp_path, monkeypatch, pressure, keeping):
+    channel = Channel(str(tmp_path), 0, 2, 6)
+    monkeypatch.setattr(Channel, "playing", property(lambda self: True))
+    monkeypatch.setattr(channel_module.status, "cpu_pressure", lambda: pressure)
+    monkeypatch.setattr(channel._pace, "ratio", lambda clock, over: keeping)
+    channel._stall = lambda clock: None
+    channel.slow_player = lambda clock, bitrate: None
+    return channel.quality()
+
+
+def test_cpu_pressure_alone_is_no_verdict(tmp_path, monkeypatch) -> None:
+    verdict = _judged(tmp_path, monkeypatch, (15.0, 14.0), 1.0)
+
+    assert verdict["state"] == "good"
+    assert "cpu_pressure" not in verdict
+
+
+def test_cpu_pressure_is_named_when_the_stream_is_late(tmp_path, monkeypatch) -> None:
+    verdict = _judged(tmp_path, monkeypatch, (25.0, 12.0), 0.5)
+
+    assert verdict["state"] == "poor"
+    assert "the link is behind" in verdict["because"]
+    assert "short of CPU (25%" in verdict["because"]
+    assert verdict["cpu_pressure"] == 25.0
+
+
+def test_a_late_stream_on_an_unloaded_box_does_not_blame_the_cpu(tmp_path, monkeypatch) -> None:
+    verdict = _judged(tmp_path, monkeypatch, (2.0, 3.0), 0.5)
+
+    assert verdict["state"] == "poor"
+    assert "CPU" not in verdict["because"]
