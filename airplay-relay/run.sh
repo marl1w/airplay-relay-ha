@@ -42,4 +42,12 @@ if ! avahi-daemon --check 2>/dev/null; then
 fi
 
 cd /opt
+# Ahead of the box's other add-ons when they compete for a core: the box is mostly idle, but many small
+# bursty processes (camera decoders) often hold a core for the few milliseconds a segment needs. uxplay
+# and ffmpeg inherit it. Needs SYS_NICE (config.yaml); without it the relay runs at normal priority.
+if nice -n -5 true 2>/dev/null; then
+    echo "running at raised CPU priority (nice -5)"
+    exec nice -n -5 python3 -m airplay_relay
+fi
+echo "cannot raise CPU priority (no SYS_NICE); running at normal priority"
 exec python3 -m airplay_relay

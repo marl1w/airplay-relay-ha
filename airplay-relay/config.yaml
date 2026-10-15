@@ -1,5 +1,5 @@
 name: AirPlay Relay
-version: "0.4.23"
+version: "0.4.24"
 slug: airplay_relay
 description: AirPlay a video from your phone and every screen in the house can watch it
 url: https://github.com/marl1w/airplay-relay-ha
@@ -11,6 +11,9 @@ boot: manual
 
 # Multicast discovery and port 7000 need the host network.
 host_network: true
+# Lets run.sh raise the relay's CPU priority (nice -5) above the other add-ons.
+privileged:
+  - SYS_NICE
 
 ingress: true
 # Fixed for an app on the host network; the stream is served from the same port.
