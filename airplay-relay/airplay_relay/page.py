@@ -92,6 +92,10 @@ PAGE = """<!DOCTYPE html>
   .chart .head { fill: var(--accent); stroke: var(--card); stroke-width: 2; }
   .chart .crosshair { stroke: var(--muted); stroke-width: 1; stroke-dasharray: 3 3; }
   .chart .empty { fill: var(--muted); font-size: 12px; }
+  .chart .q-good { fill: var(--good); opacity: .55; }
+  .chart .q-fair { fill: var(--warn); opacity: .6; }
+  .chart .q-poor { fill: var(--bad); opacity: .65; }
+  .chart .q-starting { fill: var(--idle); opacity: .4; }
 
   code.row { display: flex; align-items: center; gap: 10px; }
   code.row span.url { flex: 1; min-width: 0; word-break: break-all; }
@@ -149,6 +153,11 @@ PAGE = """<!DOCTYPE html>
         <div class="because" id="verdictWhy">waiting for the first figures</div>
         <div class="because" id="verdictHelp" hidden></div>
       </div>
+    </div>
+    <div class="chart">
+      <h3><span>Quality</span><span class="now" id="chartQualityNow">–</span></h3>
+      <svg id="chartQuality" viewBox="0 0 600 88" preserveAspectRatio="none"
+           role="img" aria-label="How the stream went over this stream: good, fair or struggling"></svg>
     </div>
     <div class="chart">
       <h3><span>Watching</span><span class="now" id="chartViewersNow">–</span></h3>
@@ -271,6 +280,66 @@ function drawChart(svg, points, format) {
     readout.setAttribute("x", Math.min(x(near.at) + 6, W - 90));
     readout.setAttribute("opacity", 1);
     readout.textContent = `${timeOfDay(near.at)} · ${format(near.value)}`;
+  };
+  svg.onmouseleave = () => {
+    crosshair.setAttribute("opacity", 0);
+    readout.setAttribute("opacity", 0);
+  };
+}
+
+const QUALITY = {
+  good: { level: 3, word: "Good" }, fair: { level: 2, word: "Fair" },
+  poor: { level: 1, word: "Struggling" }, starting: { level: 0.5, word: "Starting" },
+};
+
+// Quality over the stream: one bar per reading, as tall and coloured as its verdict.
+function drawQuality(svg, samples) {
+  const W = 600, H = 88, PAD = 14;
+  svg.innerHTML = "";
+  const ns = "http://www.w3.org/2000/svg";
+  const make = (kind, attrs, text) => {
+    const node = document.createElementNS(ns, kind);
+    for (const [key, value] of Object.entries(attrs)) node.setAttribute(key, value);
+    if (text !== undefined) node.textContent = text;
+    svg.appendChild(node);
+    return node;
+  };
+  const points = samples.filter(s => QUALITY[s.state]);
+  if (points.length < 2) {
+    make("text", { x: 0, y: H / 2, class: "empty" },
+         points.length ? "one reading so far" : "nothing judged yet");
+    return;
+  }
+  const first = points[0].at, last = points[points.length - 1].at;
+  const span = Math.max(1, last - first);
+  const x = at => PAD + ((at - first) / span) * (W - PAD * 2);
+  const y = level => H - PAD - (level / 3.3) * (H - PAD * 2);
+
+  for (const level of [1, 2, 3]) make("line", { x1: 0, y1: y(level), x2: W, y2: y(level), class: "grid-line" });
+  make("text", { x: 0, y: y(3) - 4, class: "axis" }, "good");
+  make("text", { x: 0, y: H - 2, class: "axis" }, timeOfDay(first));
+  make("text", { x: W, y: H - 2, class: "axis", "text-anchor": "end" }, timeOfDay(last));
+  const step = (W - PAD * 2) / Math.max(1, points.length - 1);
+  points.forEach((p, i) => {
+    const right = i < points.length - 1 ? x(points[i + 1].at) : x(p.at) + Math.min(step, 6);
+    const left = x(p.at);
+    make("rect", { x: left, y: y(QUALITY[p.state].level), width: Math.max(1, right - left),
+                   height: y(0) - y(QUALITY[p.state].level), class: "q-" + p.state });
+  });
+
+  const crosshair = make("line", { x1: 0, y1: 0, x2: 0, y2: H, class: "crosshair", opacity: 0 });
+  const readout = make("text", { x: 0, y: 12, class: "axis", opacity: 0 });
+  svg.onmousemove = event => {
+    const box = svg.getBoundingClientRect();
+    const at = first + ((event.clientX - box.left) / box.width) * span;
+    const near = points.reduce((a, b) => Math.abs(b.at - at) < Math.abs(a.at - at) ? b : a);
+    crosshair.setAttribute("x1", x(near.at));
+    crosshair.setAttribute("x2", x(near.at));
+    crosshair.setAttribute("opacity", 1);
+    readout.setAttribute("x", Math.min(x(near.at) + 6, W - 150));
+    readout.setAttribute("opacity", 1);
+    readout.textContent = `${timeOfDay(near.at)} · ${QUALITY[near.state].word}`
+      + (near.cpu !== null && near.cpu !== undefined ? ` · CPU wait ${near.cpu}%` : "");
   };
   svg.onmouseleave = () => {
     crosshair.setAttribute("opacity", 0);
@@ -419,6 +488,11 @@ function showQuality(data) {
   help.hidden = !help.textContent;
 
   const samples = data.samples || [];
+  drawQuality($("chartQuality"), samples);
+  const judged = samples.filter(s => QUALITY[s.state] && s.state !== "starting");
+  const fine = judged.filter(s => s.state === "good").length;
+  $("chartQualityNow").textContent = data.playing && judged.length
+    ? `${Math.round(100 * fine / judged.length)}% good` : "–";
   drawChart($("chartViewers"),
             samples.map(s => ({ at: s.at, value: s.viewers || 0 })), players);
   drawChart($("chartRate"),
@@ -504,14 +578,17 @@ function renderPast(sessions) {
     if (rates.length > 1) {
       const detail = document.createElement("details");
       detail.innerHTML = "<summary>How it went</summary>"
+        + `<div class="chart"><h3><span>Quality</span></h3>`
+        + `<svg viewBox="0 0 600 88" preserveAspectRatio="none"></svg></div>`
         + `<div class="chart"><h3><span>Bitrate published</span></h3>`
         + `<svg viewBox="0 0 600 88" preserveAspectRatio="none"></svg></div>`
         + `<div class="chart"><h3><span>Watching</span></h3>`
         + `<svg viewBox="0 0 600 88" preserveAspectRatio="none"></svg></div>`;
       row.appendChild(detail);
-      const [rateSvg, viewerSvg] = detail.querySelectorAll("svg");
+      const [qualitySvg, rateSvg, viewerSvg] = detail.querySelectorAll("svg");
       detail.addEventListener("toggle", () => {
         if (!detail.open) return;
+        drawQuality(qualitySvg, session.samples);
         drawChart(rateSvg, session.samples.filter(s => s.kbps)
                   .map(s => ({ at: s.at, value: s.kbps })), rate);
         drawChart(viewerSvg, session.samples

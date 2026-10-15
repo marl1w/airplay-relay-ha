@@ -996,6 +996,7 @@ class Channel:
                 "fetching": self.fetching,
                 "extra_delay": round(self._cushion),
                 "state": verdict["state"],
+                "cpu": round(pressure[0]) if (pressure := status.cpu_pressure()) else None,
             },
         )
         self.history.describe(
