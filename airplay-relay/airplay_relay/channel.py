@@ -726,7 +726,11 @@ class Channel:
             _LOGGER.warning("could not inspect the source: %s", error)
 
     def _consider_pulling(self, playlists: list[str], variant: int) -> None:
-        """Pull a master playlist's renditions here if its segments are plain MPEG-TS."""
+        """Pull a master playlist's renditions here if their segments are MPEG-TS.
+
+        Plain segments are held in reserve for parallel pulling; segments hiding MPEG-TS
+        behind a prefix must be stripped here, as ffmpeg's HLS reader sees only the prefix.
+        """
         if not playlists or not all(playlists):
             return
         try:
@@ -745,14 +749,23 @@ class Channel:
                 return
             request = Request(urljoin(playlists[variant], segment), headers=headers)
             with urlopen(request, timeout=15) as response:
-                head = response.read(PACKET + 1)
+                sample = response.read(400_000)
         except Exception as error:
             _LOGGER.info("not pulling the segments here: %s", error)
             return
-        if len(head) > PACKET and head[0] == SYNC and head[PACKET] == SYNC:
+        if len(sample) > PACKET and sample[0] == SYNC and sample[PACKET] == SYNC:
             self._pull_urls = playlists
             _LOGGER.info(
                 "the segments are plain MPEG-TS; pulling them here over parallel connections"
+            )
+        elif offset := payload_offset(sample):
+            self._pull_urls = playlists
+            self._needs_stripping = True
+            _LOGGER.warning(
+                "the rendition's segments hide MPEG-TS behind %d bytes of %s; they will be "
+                "fetched and stripped here, because ffmpeg's HLS reader stops at the prefix",
+                offset,
+                sample[8:12].decode(errors="replace").strip() or "prefix",
             )
 
     def snapshot(self) -> dict:
@@ -1080,7 +1093,7 @@ class Channel:
         republisher = Republisher(
             self.directory, PLAYLIST, self.hls_list_size, start=self._numbering_starts_at()
         )
-        if self._pulling and self._pull_urls:
+        if self._pull_urls:
             at = self._variant if self._variant is not None and len(self._pull_urls) > 1 else 0
             url = self._pull_urls[at]
         puller = StrippingPuller(url, self.user_agent)
@@ -1138,7 +1151,7 @@ class Channel:
             url,
             # Every audio track; no subtitles, as MPEG-TS cannot carry HLS WebVTT.
             *(
-                ("-map", f"0:p:{self._variant}:v:0", "-map", f"0:p:{self._variant}:a")
+                ("-map", f"0:p:{self._variant}:v:0", "-map", f"0:p:{self._variant}:a?")
                 if self._variant is not None
                 else ("-map", "0:v:0", "-map", "0:a?")
             ),

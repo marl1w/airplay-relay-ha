@@ -304,3 +304,43 @@ def test_a_late_stream_on_an_unloaded_box_does_not_blame_the_cpu(tmp_path, monke
 
     assert verdict["state"] == "poor"
     assert "CPU" not in verdict["because"]
+
+
+def test_a_rendition_hiding_mpeg_ts_behind_a_prefix_is_stripped_here(tmp_path) -> None:
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    import threading
+
+    image = b"RIFF\x00\x10\x00\x00WEBPVP8 " + b"\x00" * 2000
+    segment = image + (b"\x47" + b"\x00" * 187) * 16
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            if self.path == "/master.m3u8":
+                body = (
+                    b"#EXTM3U\n"
+                    b'#EXT-X-STREAM-INF:BANDWIDTH=2820000,RESOLUTION=1920x1080,CODECS="avc1,mp4a"\n'
+                    b"tracks/mono.m3u8\n"
+                )
+            elif self.path == "/tracks/mono.m3u8":
+                body = b"#EXTM3U\n#EXT-X-TARGETDURATION:4\n#EXTINF:4.0,\n1.ts\n"
+            else:
+                body = segment
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args) -> None:
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        channel = Channel(directory=str(tmp_path / "channel"), port=0, hls_time=2, hls_list_size=6)
+        base = f"http://127.0.0.1:{server.server_port}"
+        channel._inspect(f"{base}/master.m3u8")
+    finally:
+        server.shutdown()
+
+    assert channel._needs_stripping
+    assert channel._pull_urls == [f"{base}/tracks/mono.m3u8"]
