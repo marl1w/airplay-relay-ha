@@ -19,9 +19,10 @@ SPLIT = 4
 class Fetcher:
     """Reuses one connection per host and thread, so a segment skips the handshake."""
 
-    def __init__(self, user_agent: str = "", timeout: float = 20.0) -> None:
+    def __init__(self, user_agent: str = "", timeout: float = 20.0, referer: str = "") -> None:
         """Identify as the given client, giving up on a request after `timeout` seconds."""
         self.user_agent = user_agent
+        self.referer = referer
         self.timeout = timeout
         self._local = threading.local()
         self._slices = ThreadPoolExecutor(max_workers=SPLIT * 3, thread_name_prefix="slice")
@@ -44,13 +45,19 @@ class Fetcher:
         if connection := pool.pop((scheme, host), None):
             connection.close()
 
+    def _headers(self) -> dict[str, str]:
+        headers = {"User-Agent": self.user_agent} if self.user_agent else {}
+        if self.referer:
+            headers["Referer"] = self.referer
+        return headers
+
     def get_plain(self, url: str) -> bytes:
         """Fetch over a connection of its own, as a browser would."""
         return self._plain(url)
 
     def _plain(self, url: str) -> bytes:
         """Fetch with a connection of its own, which follows redirects."""
-        headers = {"User-Agent": self.user_agent} if self.user_agent else {}
+        headers = self._headers()
         with urlopen(Request(url, headers=headers), timeout=self.timeout) as response:
             return response.read()
 
@@ -69,7 +76,7 @@ class Fetcher:
         target = parts.path or "/"
         if parts.query:
             target += f"?{parts.query}"
-        headers = {"User-Agent": self.user_agent} if self.user_agent else {}
+        headers = self._headers()
         if span:
             headers["Range"] = f"bytes={span[0]}-{span[1]}"
 

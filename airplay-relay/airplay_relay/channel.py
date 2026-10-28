@@ -183,6 +183,8 @@ class Channel:
         """Prepare the segment directory and the server that will offer it."""
         self.directory = Path(directory)
         self.user_agent = user_agent
+        # The Referer the sender's player used for the current source, if it told us.
+        self.referer = ""
         self.name = name
         self.hostname = hostname
         self.dns_name = status.dns_name(address) if address else ""
@@ -201,6 +203,7 @@ class Channel:
         self._details: dict = {}
         self._describer: asyncio.Task[None] | None = None
         self._paused_url: str | None = None
+        self._paused_referer = ""
         self._last_error: str | None = None
         self._is_hls = True
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -224,7 +227,7 @@ class Channel:
         self._watcher: asyncio.Task[None] | None = None
         self._stopping: asyncio.Task[None] | None = None
         # The stream stopped for want of viewers, and when, so a player can wake it.
-        self._dozing: tuple[str, float] | None = None
+        self._dozing: tuple[str, float, str] | None = None
         self._dozing_lock = threading.Lock()
         self._switching = False
         self._republisher: Republisher | None = None
@@ -293,8 +296,8 @@ class Channel:
             CHANNEL_LIST,
         )
 
-    async def play(self, url: str) -> None:
-        """Replace whatever is playing with the stream at this URL."""
+    async def play(self, url: str, referer: str = "") -> None:
+        """Replace whatever is playing with the stream at this URL, fetched with this Referer."""
         covered = self.standing_by
         with self._dozing_lock:
             self._dozing = None
@@ -305,6 +308,7 @@ class Channel:
         if not covered:
             self._clear()
         self.source_url = url
+        self.referer = referer
         self._last_error = None
         self._started_at = time.monotonic()
         self._details = {}
@@ -312,6 +316,7 @@ class Channel:
             self._session = self.history.start(
                 source_url=url,
                 source_host=status.source_host(url),
+                referer=referer,
                 sender=dict(self.sender),
                 name=self.name,
             )
@@ -327,6 +332,7 @@ class Channel:
             return
         url, self.source_url = self.source_url, None
         self._paused_url = url
+        self._paused_referer = self.referer
         await self._halt()
         _LOGGER.info("paused")
 
@@ -336,7 +342,7 @@ class Channel:
             return
         url, self._paused_url = self._paused_url, None
         _LOGGER.info("resuming")
-        await self.play(url)
+        await self.play(url, self._paused_referer)
 
     def note_sender(self, details: dict[str, str]) -> None:
         """Record who is sending, and that they were heard from just now."""
@@ -581,11 +587,12 @@ class Channel:
         url = session.get("source_url") if session else None
         if not url:
             return False
+        referer = str(session.get("referer") or "")
         _LOGGER.info("playing again from the record: %s", url)
         loop = self._loop
         if loop is None:
             return False
-        loop.call_soon_threadsafe(lambda: asyncio.create_task(self.play(url)))
+        loop.call_soon_threadsafe(lambda: asyncio.create_task(self.play(url, referer)))
         return True
 
     def request_stop(self) -> None:
@@ -629,6 +636,12 @@ class Channel:
                 await supervisor
         await self._kill()
 
+    def _headers(self) -> dict[str, str]:
+        headers = {"User-Agent": self.user_agent} if self.user_agent else {}
+        if self.referer:
+            headers["Referer"] = self.referer
+        return headers
+
     @staticmethod
     def _looks_like_hls(url: str) -> bool:
         """Guess from the URL, for when the source cannot be fetched first."""
@@ -637,7 +650,7 @@ class Channel:
     def _inspect(self, url: str) -> None:
         """Log what the source actually serves, and pick a rendition from a master playlist."""
         try:
-            headers = {"User-Agent": self.user_agent} if self.user_agent else {}
+            headers = self._headers()
             with urlopen(Request(url, headers=headers), timeout=10) as response:
                 raw = response.read(65536)
                 self._is_hls = raw.lstrip()[:7] == b"#EXTM3U"
@@ -734,7 +747,7 @@ class Channel:
         if not playlists or not all(playlists):
             return
         try:
-            headers = {"User-Agent": self.user_agent} if self.user_agent else {}
+            headers = self._headers()
             with urlopen(Request(playlists[variant], headers=headers), timeout=10) as response:
                 media = response.read(65536).decode("utf-8", "replace")
             segment = next(
@@ -876,7 +889,7 @@ class Channel:
         await self.stop("nobody watching")
         if url:
             with self._dozing_lock:
-                self._dozing = (url, time.monotonic())
+                self._dozing = (url, time.monotonic(), self.referer)
 
     @property
     def wakes_for(self) -> float | None:
@@ -893,11 +906,11 @@ class Channel:
             dozing, self._dozing = self._dozing, None
         if dozing is None or self._loop is None:
             return
-        url, since = dozing
+        url, since, referer = dozing
         if time.monotonic() - since > WAKE_MINUTES * 60:
             return
         _LOGGER.info("a player tuned in; starting the stream again: %s", url)
-        self._loop.call_soon_threadsafe(lambda: asyncio.create_task(self.play(url)))
+        self._loop.call_soon_threadsafe(lambda: asyncio.create_task(self.play(url, referer)))
 
     async def _adapt(self) -> None:
         """Move down the source's renditions when the link cannot keep up."""
@@ -1048,6 +1061,8 @@ class Channel:
     async def _supervise(self, url: str) -> None:
         """Keep the stream running until this task is cancelled."""
         _LOGGER.info("pulling %s", url)
+        if self.referer:
+            _LOGGER.info("fetching with the sender's Referer %s", self.referer)
         self._is_hls = self._looks_like_hls(url)
         self._needs_stripping = False
         self._pull_urls = []
@@ -1096,7 +1111,7 @@ class Channel:
         if self._pull_urls:
             at = self._variant if self._variant is not None and len(self._pull_urls) > 1 else 0
             url = self._pull_urls[at]
-        puller = StrippingPuller(url, self.user_agent)
+        puller = StrippingPuller(url, self.user_agent, self.referer)
         # Always parallel: one connection cannot fetch the stream ahead of real time,
         # and without running ahead the buffer never fills.
         self._pulling = puller.parallel = True
@@ -1128,6 +1143,7 @@ class Channel:
             "-probesize",
             "50000000",
             *(("-user_agent", self.user_agent) if self.user_agent else ()),
+            *(("-referer", self.referer) if self.referer else ()),
             # Keep connections open between segments, and ride out a dropped one.
             "-http_persistent",
             "1",

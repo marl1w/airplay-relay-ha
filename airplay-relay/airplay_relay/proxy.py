@@ -157,6 +157,8 @@ class Proxy:
         self._responder = responder
         self._observer = observer
         self._idle_seconds = idle_seconds
+        # The sender's reverse channel, over which a receiver may ask it to fetch a URL.
+        self.reverse: asyncio.StreamWriter | None = None
 
     async def serve(self) -> asyncio.Server:
         """Start accepting sessions."""
@@ -231,6 +233,7 @@ class Proxy:
                 # /reverse upgrades to a raw byte channel with no more messages to parse.
                 if response.start_line.startswith("HTTP/1.1 101"):
                     _LOGGER.debug("%s upgraded to a reverse channel", label)
+                    self.reverse = client_writer
                     await _shuttle(client_reader, upstream_writer, upstream_reader, client_writer)
                     break
         except (ConnectionResetError, BrokenPipeError, asyncio.IncompleteReadError):
@@ -244,6 +247,38 @@ class Proxy:
             for writer in (upstream_writer, client_writer):
                 if writer is not None:
                     writer.close()
+
+
+async def ask_sender(
+    reverse: asyncio.StreamWriter | None, url: str, session: str, request_id: int
+) -> bool:
+    """Ask the sender to fetch a URL itself (FCUP); its answer comes back as POST /action."""
+    if reverse is None or reverse.is_closing():
+        return False
+    body = plistlib.dumps(
+        {
+            "sessionID": 1,
+            "type": "unhandledURLRequest",
+            "request": {
+                "FCUP_Response_ClientInfo": 1,
+                "FCUP_Response_ClientRef": 40030004,
+                "FCUP_Response_RequestID": request_id,
+                "FCUP_Response_URL": url,
+                "sessionID": 1,
+                "FCUP_Response_Headers": {"X-Playback-Session-Id": session},
+            },
+        },
+        fmt=plistlib.FMT_XML,
+    )
+    head = (
+        "POST /event HTTP/1.1\r\n"
+        f"X-Apple-Session-ID: {session}\r\n"
+        "Content-Type: text/x-apple-plist+xml\r\n"
+        f"Content-Length: {len(body)}\r\n\r\n"
+    )
+    reverse.write(head.encode() + body)
+    await reverse.drain()
+    return True
 
 
 def _keep_alive(writer: asyncio.StreamWriter) -> None:

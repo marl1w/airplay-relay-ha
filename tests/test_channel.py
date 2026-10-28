@@ -188,8 +188,8 @@ def test_a_stream_stopped_over_an_hour_ago_stays_stopped(tmp_path, monkeypatch) 
     async def scenario() -> None:
         channel = _channel(tmp_path)
         await _dozed(channel, "https://example.com/live.m3u8")
-        url, _ = channel._dozing
-        channel._dozing = (url, time.monotonic() - (WAKE_MINUTES * 60 + 1))
+        url, _, referer = channel._dozing
+        channel._dozing = (url, time.monotonic() - (WAKE_MINUTES * 60 + 1), referer)
         assert channel.wakes_for is None
 
         channel.wake()

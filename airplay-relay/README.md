@@ -119,6 +119,37 @@ Whether the player shows those names or just "Track 1, Track 2" depends on
 ffmpeg: it carries the languages as far as the transport stream, whose muxer
 does not always write them all back out.
 
+## Sources that want the page they came from
+
+Some sources answer only requests that carry the page embedding their player as
+`Referer`, and refuse everything else with `412`. AirPlay never hands that page
+over -- not in `/play`, and an Apple TV fails on these sources for the same
+reason.
+
+The phone knows it, though. When a stream is handed over, the relay asks the phone
+over the AirPlay reverse channel to fetch one URL on the relay itself, and the
+phone fetches it as the page's own player would, `Referer` included. The relay
+reads it from that request, then pulls the stream directly with it, and the phone
+is free to go as usual. Nothing about any site is configured or stored beyond the
+stream's own record, so a replay or a restart reuses what the phone said.
+
+iOS fetches that URL only over HTTPS with a certificate it trusts, so the relay
+answers on its own address under [local-ip.sh](https://local-ip.sh), a
+wildcard-DNS domain whose Let's Encrypt certificate is published for this use:
+`192.168.1.10` becomes `https://192-168-1-10.local-ip.sh:8443`. The certificate is
+fetched at startup and again every day, so its renewals are picked up without a
+restart. The request stays inside the house; local-ip.sh only ever sees the
+certificate download.
+
+Routers with DNS rebind protection (OpenWrt's unbound and dnsmasq enable it)
+drop public names that resolve to private addresses, so the box's one name has
+to be allowed, ideally answered locally. With unbound, in
+`/etc/unbound/unbound_srv.conf`:
+
+    local-data: "192-168-1-10.local-ip.sh. 300 IN A 192.168.1.10"
+
+Without it the relay simply plays as before, without a `Referer`.
+
 ## Configuration
 
 | Option | What it does |
@@ -130,7 +161,7 @@ does not always write them all back out.
 Everything else has a value established by testing and is set in the code. The
 few that are worth changing while diagnosing something -- the HLS window, the
 address advertised on a multi-homed host, the user agent the stream is fetched
-with -- can be overridden through environment variables, and are listed in
+with, the echo's domain, address and port -- can be overridden through environment variables, and are listed in
 `config.py`.
 
 ## If it does not appear in the picker

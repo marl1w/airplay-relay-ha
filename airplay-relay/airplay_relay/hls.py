@@ -145,14 +145,15 @@ def target_duration(playlist: str, default: float = 4.0) -> float:
 class StrippingPuller:
     """Reads an HLS stream and writes plain MPEG-TS to whatever will take it."""
 
-    def __init__(self, url: str, user_agent: str = "") -> None:
+    def __init__(self, url: str, user_agent: str = "", referer: str = "") -> None:
         """Pull the playlist at this URL, identifying as the given client."""
         self.url = url
         self.user_agent = user_agent
+        self.referer = referer
         self.lead = LEAD_SECONDS
         # Plain, one-at-a-time fetching unless told otherwise.
         self.parallel = False
-        self._fetcher = Fetcher(user_agent)
+        self._fetcher = Fetcher(user_agent, referer=referer)
         self.segments = 0
         self.stripped_bytes = 0
         self._seen: list[str] = []

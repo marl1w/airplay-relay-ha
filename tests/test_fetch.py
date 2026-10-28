@@ -180,3 +180,33 @@ def test_a_slow_start_begins_anyway_after_the_wait(tmp_path) -> None:
 
     republisher.release(now=21.0)
     assert _listed(tmp_path) == 1
+
+
+def test_the_referer_is_sent_on_every_kind_of_fetch() -> None:
+    seen: list[str | None] = []
+
+    class Gate(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def do_GET(self) -> None:
+            seen.append(self.headers.get("Referer"))
+            allowed = self.headers.get("Referer") == "https://page.example/"
+            body = SEGMENT if allowed else b"no"
+            self.send_response(200 if allowed else 412)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args) -> None:
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Gate)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        url = f"http://127.0.0.1:{server.server_port}/a.ts"
+        fetcher = Fetcher("test", referer="https://page.example/")
+        assert fetcher.get_plain(url) == SEGMENT
+        assert fetcher.get(url) == SEGMENT
+    finally:
+        server.shutdown()
+    assert seen == ["https://page.example/", "https://page.example/"]

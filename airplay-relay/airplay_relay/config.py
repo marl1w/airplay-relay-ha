@@ -64,6 +64,11 @@ class Config:
             "user_agent",
             "AppleCoreMedia/1.0.0.22L572 (Apple TV; U; CPU OS 18_0 like Mac OS X; en_us)",
         )
+        # Where senders are asked to fetch from, so the Referer their player uses can be read.
+        # The name is this box's own address under a wildcard-DNS domain with a published cert.
+        self.echo_domain = self._setting("echo_domain", "local-ip.sh")
+        self.echo_address = self._setting("echo_address", "") or self.address
+        self.echo_port = int(self._setting("echo_port", "8443"))
         self.hls_time = int(self._setting("hls_time", "2"))
         self.hls_list_size = int(self._setting("hls_list_size", "6"))
 

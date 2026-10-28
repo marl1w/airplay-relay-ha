@@ -11,9 +11,10 @@ import signal
 
 from .channel import Channel
 from .config import Config
+from .echo import Echo
 from .history import open_in
 from .mirror import Mirror, read_upstream
-from .proxy import Message, Proxy, plist_response
+from .proxy import Message, Proxy, ask_sender, plist_response
 from .uxplay import build_command, run as run_uxplay
 
 _LOGGER = logging.getLogger(__name__)
@@ -66,10 +67,33 @@ async def run_channel(config: Config, url: str | None) -> None:
             "the last stream was still playing when the add-on stopped; starting it again: %s",
             resuming["source_url"],
         )
-        await channel.play(resuming["source_url"])
+        await channel.play(resuming["source_url"], str(resuming.get("referer") or ""))
 
     # A replaced session must not control the stream that superseded it.
     current_session: dict[str, str | None] = {"id": None}
+
+    echo = Echo(
+        config.echo_address,
+        config.echo_port,
+        config.echo_domain,
+        os.path.join(config.state_dir, "echo"),
+    )
+    links: dict[str, Proxy] = {}
+    # The stream being started: the sender is asked for its Referer before it is pulled.
+    starting: dict[str, asyncio.Task | None] = {"task": None}
+
+    async def start(location: str, session: str | None) -> None:
+        """Learn the Referer the sender's player uses for this stream, then play it."""
+        proxy = links.get("proxy")
+
+        async def ask(url: str) -> bool:
+            return await ask_sender(proxy.reverse if proxy else None, url, session or "", 1)
+
+        headers = await echo.learn(ask)
+        referer = headers.get("referer", "")
+        if referer:
+            _LOGGER.info("the sender's player fetches it with Referer %s", referer)
+        await channel.play(location, referer)
 
     APPS = {
         "com.apple.WebKit.GPU": "Safari",
@@ -155,11 +179,21 @@ async def run_channel(config: Config, url: str | None) -> None:
         """Answer the requests the proxy keeps for us."""
         if message.path == "/play":
             payload = message.plist()
+            # Everything the sender hands over, to learn what a fussy source needs from it.
+            for name, value in message.headers.items():
+                _LOGGER.debug("/play header %s: %s", name, str(value)[:500])
+            if isinstance(payload, dict):
+                for key, value in payload.items():
+                    _LOGGER.debug("/play field %s: %s", key, str(value)[:2000])
             location = payload.get("Content-Location") if isinstance(payload, dict) else None
             if location:
                 current_session["id"] = session_of(message)
                 _LOGGER.warning("handed a stream: %s", location)
-                await channel.play(str(location))
+                # Started after this reply: the sender answers the echo request only once
+                # its /play has been answered.
+                if (previous := starting["task"]) is not None:
+                    previous.cancel()
+                starting["task"] = asyncio.create_task(start(str(location), session_of(message)))
             return None
 
         # The sender is only a remote: a new /play replaces the stream, /stop never ends it.
@@ -171,7 +205,8 @@ async def run_channel(config: Config, url: str | None) -> None:
 
         if message.path == "/playback-info":
             # Deliberately `requested`, not `playing`: the sender's play path depends on it.
-            playing = channel.requested
+            task = starting["task"]
+            playing = channel.requested or (task is not None and not task.done())
             position = channel.position
             # duration 0 means live; without advancing ranges the sender assumes a stall.
             ranges = [{"start": 0.0, "duration": position}] if playing else []
@@ -200,12 +235,14 @@ async def run_channel(config: Config, url: str | None) -> None:
         extra=config.uxplay_extra_args,
     )
 
+    await echo.start()
     uxplay = asyncio.create_task(run_uxplay(command))
     waiter = asyncio.create_task(stop.wait())
     try:
         upstream_port, properties = await read_upstream()
         async with Mirror(config, properties, config.port):
-            server = await Proxy(config.port, upstream_port, respond, note_sender).serve()
+            links["proxy"] = Proxy(config.port, upstream_port, respond, note_sender)
+            server = await links["proxy"].serve()
             async with server:
                 await asyncio.wait({uxplay, waiter}, return_when=asyncio.FIRST_COMPLETED)
         if uxplay.done() and not waiter.done():
@@ -215,6 +252,7 @@ async def run_channel(config: Config, url: str | None) -> None:
     finally:
         for task in (uxplay, waiter):
             task.cancel()
+        await echo.close()
         # "interrupted" marks the stream to be resumed when the add-on starts again.
         await channel.stop("interrupted")
         channel.close()
