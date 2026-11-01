@@ -16,7 +16,8 @@ START_SECONDS_BACK = 20.0
 # Segments listed at once when a smoothed feed begins, as players need a few to start.
 OPENING_SEGMENTS = 3
 
-# The longest a smoothed feed waits to fill its reservoir before it begins anyway.
+# The longest a smoothed feed waits to fill its reservoir before it begins anyway,
+# unless it was asked to hold back more than this.
 PRIME_SECONDS = 20.0
 
 
@@ -83,7 +84,8 @@ class Republisher:
         elif not self._playing:
             typical = max((duration for _, duration, _ in self._pending), default=0.0)
             filled = self.reservoir >= self.depth + OPENING_SEGMENTS * typical
-            if self._pending and (filled or now - self._waiting_since >= PRIME_SECONDS):
+            waited = now - self._waiting_since >= max(PRIME_SECONDS, self.depth)
+            if self._pending and (filled or waited):
                 self._playing = True
                 last = 0.0
                 for _ in range(min(OPENING_SEGMENTS, len(self._pending))):

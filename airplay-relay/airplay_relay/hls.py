@@ -26,6 +26,33 @@ LEAD_SECONDS = 12.0
 # Segments fetched at once, so one slow transfer does not hold up the rest.
 PARALLEL = 3
 
+# A segment starting this far from where the last one ended is a jump, not jitter.
+JUMP_SECONDS = 1.0
+
+# A segment from no further back than this, and wholly sent already, is a repeat;
+# further back, the source has restarted its clock and it is a jump.
+REPEAT_SECONDS = 120.0
+
+# MPEG-TS timestamps count 90kHz ticks in 33 bits, and wrap.
+TICKS = 90_000
+WRAP = 1 << 33
+
+
+def first_pts(data: bytes) -> int | None:
+    """Return the presentation time of the first timed packet, in 90kHz ticks."""
+    for at in range(0, len(data) - PACKET + 1, PACKET):
+        packet = data[at : at + PACKET]
+        # A packet that starts a payload, and carries one.
+        if packet[0] != SYNC or not packet[1] & 0x40 or not packet[3] & 0x10:
+            continue
+        start = 4 + (1 + packet[4] if packet[3] & 0x20 else 0)
+        header = packet[start : start + 14]
+        if len(header) < 14 or header[:3] != b"\x00\x00\x01" or not header[7] & 0x80:
+            continue
+        b = header[9:14]
+        return ((b[0] >> 1) & 7) << 30 | b[1] << 22 | (b[2] >> 1) << 15 | b[3] << 7 | b[4] >> 1
+    return None
+
 
 def payload_offset(data: bytes) -> int:
     """Return where the transport stream starts, skipping any prefix."""
@@ -211,6 +238,8 @@ class StrippingPuller:
 
         poller = asyncio.ensure_future(poll())
         missed = False
+        # Where the next segment's timestamps should begin, if the source runs on unbroken.
+        expected: int | None = None
         try:
             while True:
                 download_task, seconds = await queue.get()
@@ -228,7 +257,33 @@ class StrippingPuller:
                 self.stripped_bytes += offset
                 if not self._started:
                     self._started = loop.time()
-                result = write(data[offset:], seconds, missed)
+                payload = data[offset:]
+                # A source can skip segments without saying so; players must be told.
+                begins = first_pts(payload)
+                if begins is not None and expected is not None:
+                    step = (begins - expected + WRAP // 2) % WRAP - WRAP // 2
+                    # Or list again, under new names, what it already sent: players would
+                    # show it twice, so it is dropped here.
+                    if (
+                        -REPEAT_SECONDS * TICKS < step < -JUMP_SECONDS * TICKS
+                        and step + seconds * TICKS <= JUMP_SECONDS * TICKS
+                    ):
+                        _LOGGER.warning(
+                            "the source sent %.0fs of video again, from %.1fs back; "
+                            "dropping the repeat",
+                            seconds,
+                            -step / TICKS,
+                        )
+                        continue
+                    if abs(step) > JUMP_SECONDS * TICKS:
+                        if not missed:
+                            _LOGGER.warning(
+                                "the source's timeline jumps by %+.1fs; marking a discontinuity",
+                                step / TICKS,
+                            )
+                        missed = True
+                expected = None if begins is None else (begins + round(seconds * TICKS)) % WRAP
+                result = write(payload, seconds, missed)
                 if asyncio.iscoroutine(result):
                     await result
                 missed = False

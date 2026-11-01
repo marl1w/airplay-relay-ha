@@ -7,10 +7,12 @@ from collections import deque
 import contextlib
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+import io
 import json
 import logging
 import mimetypes
 from pathlib import Path
+import re
 import threading
 import time
 from urllib.parse import parse_qs, urljoin, urlparse
@@ -62,6 +64,8 @@ SETTLED_SECONDS = 60
 # Extra delay granted to a struggling stream: a step at a time, up to a ceiling.
 CUSHION_STEP = 15.0
 CUSHION_MAX = 60.0
+# The most of a site's learned delay a new stream starts with, as it also delays the first picture.
+CUSHION_START_MAX = 30.0
 # Seconds of media a smoothed feed holds back before any escalation.
 BASE_DEPTH = 20.0
 IDLE_MINUTES = 15
@@ -134,7 +138,8 @@ class _Handler(SimpleHTTPRequestHandler):
                 self.send_error(404, "nothing is playing")
                 return
             self.channel.note_viewer(self.client_address[0] if self.client_address else "")
-            super().do_GET()
+            if not (route.endswith(".ts") and self._send_range()):
+                super().do_GET()
         elif route == "/history.json":
             sessions = self.channel.history.recent() if self.channel.history else []
             self._send(json.dumps(sessions).encode(), "application/json")
@@ -151,6 +156,41 @@ class _Handler(SimpleHTTPRequestHandler):
         else:
             super().do_GET()
 
+    def _send_range(self) -> bool:
+        """Answer a request for part of a segment. False if the whole file should go.
+
+        A player that loses its place seeks within a segment; sent the whole file
+        instead, it gives up on each transfer and asks again.
+        """
+        found = re.fullmatch(r"bytes=(\d*)-(\d*)", self.headers.get("Range", "").strip())
+        if not found or found.groups() == ("", ""):
+            return False
+        try:
+            with open(self.translate_path(self.path), "rb") as segment:
+                body = segment.read()
+        except OSError:
+            self.send_error(404, "no such segment")
+            return True
+        size = len(body)
+        first, last = found.groups()
+        if first:
+            start, end = int(first), min(int(last), size - 1) if last else size - 1
+        else:
+            start, end = max(0, size - int(last)), size - 1
+        if start >= size or start > end:
+            self.send_response(416)
+            self.send_header("Content-Range", f"bytes */{size}")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return True
+        self.send_response(206)
+        self.send_header("Content-Type", "video/mp2t")
+        self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+        self.send_header("Content-Length", str(end - start + 1))
+        self.end_headers()
+        self.copyfile(io.BytesIO(body[start : end + 1]), self.wfile)
+        return True
+
     def _send(self, body: bytes, content_type: str) -> None:
         self.send_response(200)
         self.send_header("Content-Type", content_type)
@@ -162,6 +202,8 @@ class _Handler(SimpleHTTPRequestHandler):
         """Add the headers a player needs to follow a live window."""
         self.send_header("Cache-Control", "no-cache, no-store")
         self.send_header("Access-Control-Allow-Origin", "*")
+        if self.path.split("?")[0].endswith(".ts"):
+            self.send_header("Accept-Ranges", "bytes")
         super().end_headers()
 
 
@@ -233,6 +275,8 @@ class Channel:
         self._republisher: Republisher | None = None
         self._puller: StrippingPuller | None = None
         self._cushion = 0.0
+        # Extra delay a new stream starts with, from how its site behaved lately.
+        self._learned_cushion = 0.0
         self._escalated_at = 0.0
         self._transfers: deque[tuple[float, str, int, float, bool]] = deque(maxlen=200)
         self._card: list[bytes] = []
@@ -312,7 +356,11 @@ class Channel:
         self._last_error = None
         self._started_at = time.monotonic()
         self._details = {}
+        self._learned_cushion = 0.0
         if self.history is not None:
+            self._learned_cushion = min(
+                CUSHION_START_MAX, self.history.delay_needed(status.source_host(url) or "")
+            )
             self._session = self.history.start(
                 source_url=url,
                 source_host=status.source_host(url),
@@ -1116,6 +1164,12 @@ class Channel:
         # and without running ahead the buffer never fills.
         self._pulling = puller.parallel = True
         self._republisher, self._puller = republisher, puller
+        if self._learned_cushion > self._cushion:
+            self._cushion = self._learned_cushion
+            _LOGGER.info(
+                "this site's streams ran late lately; starting with a %.0fs buffer",
+                BASE_DEPTH + self._cushion,
+            )
         self._apply_cushion()
         _LOGGER.info("republishing the source's own segments, unchanged")
         try:

@@ -178,7 +178,10 @@ def test_a_slow_start_begins_anyway_after_the_wait(tmp_path) -> None:
     republisher.add(b"\x47" * 188, 6.0, now=0.0)
     assert not (tmp_path / "channel.m3u8").exists()
 
+    # Asked to hold back 30s, it waits that long for the reservoir before giving up.
     republisher.release(now=21.0)
+    assert not (tmp_path / "channel.m3u8").exists()
+    republisher.release(now=31.0)
     assert _listed(tmp_path) == 1
 
 

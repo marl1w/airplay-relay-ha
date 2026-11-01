@@ -20,6 +20,14 @@ SAMPLE_SECONDS = 30.0
 
 RESUME_WITHIN_SECONDS = 15 * 60
 
+# How far back a site's streams count when judging how much delay it needs.
+LEARN_DAYS = 7
+
+
+def site(host: str) -> str:
+    """Return the site a host belongs to, as a CDN spreads one source over many hosts."""
+    return ".".join(host.lower().split(".")[-2:])
+
 
 class History:
     """Every stream of the last month, and the one playing now."""
@@ -118,6 +126,23 @@ class History:
         if time.time() - last_seen > RESUME_WITHIN_SECONDS:
             return None
         return last
+
+    def delay_needed(self, host: str) -> float:
+        """Return the most extra delay that recent streams from this host's site came to need."""
+        if not host:
+            return 0.0
+        wanted = site(host)
+        cutoff = time.time() - LEARN_DAYS * 86400
+        return max(
+            (
+                float(sample.get("extra_delay") or 0)
+                for session in self.sessions
+                if session.get("started", 0) >= cutoff
+                and site(session.get("source_host") or "") == wanted
+                for sample in session["samples"]
+            ),
+            default=0.0,
+        )
 
     def find(self, identifier: str) -> dict[str, Any] | None:
         """Return one stream by its identifier."""
