@@ -51,6 +51,30 @@ went down is the one thing it starts again on the way back up -- within a
 quarter of an hour, and only when nobody chose to end it. A stream somebody
 stopped, or one that ran out, stays stopped.
 
+## When the source drops
+
+A segment that fails to download is tried twice more before it is given up as a
+gap, as a CDN that drops a connection usually answers a second later.
+
+When nothing new arrives for about twenty seconds -- roughly when players run out
+of what they hold -- the channel carries the standby card until the source is
+back. Left with a window that has stopped moving, a television reopens it and
+plays the same seconds over and over; the card says plainly that it is waiting.
+
+Some sites give each viewer one live link at a time: opening the stream anywhere
+else, the phone included, revokes the link the relay is pulling, and every
+request on it is then refused. After fifteen seconds of that the status page and
+the log say so. There is nothing on this side to renew it -- the new link comes
+from the site's own page, which only the phone runs -- so send the stream again
+from the phone. A fresh link to the stream already playing is taken up without a
+restart: the buffer, the delay and the channel carry on, and whatever the new link
+lists twice is dropped. It counts as the same stream when it differs only in its
+tokens or mirror and its newest segment's timestamps are close to where the relay
+has got to; anything else starts afresh as before.
+
+To watch on the phone at the same time, open the relay's own channel there rather
+than the site, so only one link is ever in use.
+
 ## Looking back
 
 The status page has a second tab holding a month of streams: what was played,

@@ -6,6 +6,7 @@ import asyncio
 from collections.abc import Callable
 import contextlib
 import logging
+import re
 from urllib.parse import urljoin
 
 from .fetch import Fetcher
@@ -36,6 +37,13 @@ REPEAT_SECONDS = 120.0
 # MPEG-TS timestamps count 90kHz ticks in 33 bits, and wrap.
 TICKS = 90_000
 WRAP = 1 << 33
+
+# Pauses before each further try at a segment that failed: a dropped connection
+# or a CDN hiccup usually answers a second later, and a skipped segment is a jump.
+SEGMENT_RETRIES = (1.0, 2.0)
+
+# Seconds of a playlist that will not load before the link counts as dead.
+REFUSED_SECONDS = 15.0
 
 
 def first_pts(data: bytes) -> int | None:
@@ -169,6 +177,20 @@ def target_duration(playlist: str, default: float = 4.0) -> float:
     return default
 
 
+def refusal_advice(failure: str, seconds: float) -> str:
+    """Say in plain words what a link that stopped loading means, and what to do."""
+    if re.search(r"HTTP Error (401|403|410)", failure):
+        return (
+            f"the source has refused the link for {seconds:.0f}s ({failure}): it has been "
+            "revoked, usually because the stream was opened on another device -- "
+            "send it again from the phone and it carries on"
+        )
+    return (
+        f"the source has not answered for {seconds:.0f}s ({failure}); still trying -- "
+        "if it does not come back, send the stream again from the phone"
+    )
+
+
 class StrippingPuller:
     """Reads an HLS stream and writes plain MPEG-TS to whatever will take it."""
 
@@ -183,9 +205,45 @@ class StrippingPuller:
         self._fetcher = Fetcher(user_agent, referer=referer)
         self.segments = 0
         self.stripped_bytes = 0
+        # Where the next segment's timestamps should begin, if the source runs on unbroken.
+        self.expected: int | None = None
+        # Since when (loop clock) every playlist fetch has failed, and the latest reason.
+        self.failing_since: float | None = None
+        self.failure = ""
+        self._said_refused = False
         self._seen: list[str] = []
         self._written = 0.0
         self._started = 0.0
+
+    def rebind(self, url: str, referer: str) -> None:
+        """Carry on from a fresh link to the same stream, keeping everything pulled so far.
+
+        Segments already seen are recognised again by their timestamps, so whatever
+        the new link lists twice is dropped and a gap it skips is marked.
+        """
+        self.url = url
+        self.referer = referer
+        self._fetcher = Fetcher(self.user_agent, referer=referer)
+        self.failing_since = None
+        self.failure = ""
+        self._said_refused = False
+
+    def refused_for(self, now: float) -> float:
+        """Seconds the playlist has failed to load without a break, or 0."""
+        return 0.0 if self.failing_since is None else now - self.failing_since
+
+    def _note_failure(self, now: float, error: Exception) -> None:
+        """Log a failed playlist fetch, and once, plainly, when the link looks dead."""
+        if self.failing_since is None:
+            self.failing_since = now
+        self.failure = str(error)
+        if self._said_refused:
+            _LOGGER.debug("playlist fetch failed: %s", error)
+            return
+        _LOGGER.warning("playlist fetch failed: %s", error)
+        if self.refused_for(now) >= REFUSED_SECONDS:
+            self._said_refused = True
+            _LOGGER.warning("%s", refusal_advice(self.failure, self.refused_for(now)))
 
     def _fetch(self, url: str) -> bytes:
         if self.parallel:
@@ -210,6 +268,14 @@ class StrippingPuller:
 
         async def download(segment: str) -> bytes:
             async with several if self.parallel else one_at_a_time:
+                for pause in SEGMENT_RETRIES:
+                    try:
+                        return await loop.run_in_executor(None, self._fetch_segment, segment)
+                    except Exception as error:
+                        _LOGGER.info(
+                            "segment fetch failed (%s); trying again in %.0fs", error, pause
+                        )
+                    await asyncio.sleep(pause)
                 return await loop.run_in_executor(None, self._fetch_segment, segment)
 
         async def poll() -> None:
@@ -219,9 +285,15 @@ class StrippingPuller:
                 try:
                     raw = await loop.run_in_executor(None, self._fetch, self.url)
                 except Exception as error:
-                    _LOGGER.warning("playlist fetch failed: %s", error)
+                    self._note_failure(began, error)
                     await asyncio.sleep(wait)
                     continue
+                if self.failing_since is not None:
+                    _LOGGER.info(
+                        "the source answers again after %.0fs", loop.time() - self.failing_since
+                    )
+                    self.failing_since = None
+                    self._said_refused = False
 
                 playlist = raw.decode("utf-8", "replace")
                 wait = target_duration(playlist) / 3
@@ -238,15 +310,17 @@ class StrippingPuller:
 
         poller = asyncio.ensure_future(poll())
         missed = False
-        # Where the next segment's timestamps should begin, if the source runs on unbroken.
-        expected: int | None = None
         try:
             while True:
                 download_task, seconds = await queue.get()
                 try:
                     data = await download_task
                 except Exception as error:
-                    _LOGGER.warning("segment fetch failed: %s", error)
+                    _LOGGER.warning(
+                        "segment fetch failed after %d tries, skipping it: %s",
+                        len(SEGMENT_RETRIES) + 1,
+                        error,
+                    )
                     missed = True
                     continue
 
@@ -260,8 +334,8 @@ class StrippingPuller:
                 payload = data[offset:]
                 # A source can skip segments without saying so; players must be told.
                 begins = first_pts(payload)
-                if begins is not None and expected is not None:
-                    step = (begins - expected + WRAP // 2) % WRAP - WRAP // 2
+                if begins is not None and self.expected is not None:
+                    step = (begins - self.expected + WRAP // 2) % WRAP - WRAP // 2
                     # Or list again, under new names, what it already sent: players would
                     # show it twice, so it is dropped here.
                     if (
@@ -282,7 +356,7 @@ class StrippingPuller:
                                 step / TICKS,
                             )
                         missed = True
-                expected = None if begins is None else (begins + round(seconds * TICKS)) % WRAP
+                self.expected = None if begins is None else (begins + round(seconds * TICKS)) % WRAP
                 result = write(payload, seconds, missed)
                 if asyncio.iscoroutine(result):
                     await result

@@ -19,15 +19,23 @@ from urllib.parse import parse_qs, urljoin, urlparse
 from urllib.request import Request, urlopen
 
 from . import standby, status
+from .fetch import Fetcher
 from .history import History
 from .hls import (
     LEAD_SECONDS,
     PACKET,
+    REFUSED_SECONDS,
+    REPEAT_SECONDS,
     SYNC,
+    TICKS,
+    WRAP,
     StrippingPuller,
     audio_renditions,
+    first_pts,
+    parse,
     payload_offset,
     pullable,
+    refusal_advice,
     variant_uris,
     variants,
 )
@@ -70,6 +78,9 @@ CUSHION_START_MAX = 30.0
 BASE_DEPTH = 20.0
 IDLE_MINUTES = 15
 WAKE_MINUTES = 60
+# How far past the relay's own position a fresh link may be and still count as the same
+# stream carrying on: the time a dead link takes to be noticed and sent again.
+CARRY_ON_SECONDS = 600.0
 # 2026-01-01 UTC, so clock-based segment numbers stay small.
 NUMBERING_EPOCH = 1_767_225_600
 
@@ -77,6 +88,29 @@ NUMBERING_EPOCH = 1_767_225_600
 mimetypes.add_type("application/vnd.apple.mpegurl", ".m3u8")
 mimetypes.add_type("video/mp2t", ".ts")
 mimetypes.add_type("application/x-mpegurl", ".m3u")
+
+
+def _token_free(url: str) -> tuple[str, tuple[str, ...]] | None:
+    """Return a URL's site and path with its tokens and timestamps blanked out.
+
+    Mirrors of one site differ in the first label of the host, and each link carries
+    tokens of its own; neither says anything about which stream it is.
+    """
+    parts = urlparse(url)
+    if not parts.hostname:
+        return None
+    site = ".".join(parts.hostname.split(".")[-2:])
+    path = tuple(
+        "*" if re.fullmatch(r"\d{6,}|[A-Za-z0-9]{16,}", piece) else piece
+        for piece in parts.path.split("/")
+    )
+    return site, path
+
+
+def same_stream_shape(old: str, new: str) -> bool:
+    """Whether two links could be the same stream: same site and path but for tokens."""
+    shape = _token_free(old)
+    return shape is not None and shape == _token_free(new)
 
 
 def _track_names(languages: list[tuple[str, str]]) -> tuple[str, ...]:
@@ -342,6 +376,8 @@ class Channel:
 
     async def play(self, url: str, referer: str = "") -> None:
         """Replace whatever is playing with the stream at this URL, fetched with this Referer."""
+        if await self._carry_on(url, referer):
+            return
         covered = self.standing_by
         with self._dozing_lock:
             self._dozing = None
@@ -373,6 +409,72 @@ class Channel:
         self._adapter = asyncio.create_task(self._adapt())
         self._gauger = asyncio.create_task(self._gauge())
         self._watcher = asyncio.create_task(self._watch())
+
+    async def _carry_on(self, url: str, referer: str) -> bool:
+        """Switch the running pull to a fresh link to the same stream. False if it is not one.
+
+        A phone sends the stream again when the old link stops working, and the site
+        gives each link a token of its own. Starting over would throw away the buffer
+        and leave every screen waiting; carrying on keeps the window moving.
+        """
+        puller, current = self._puller, self.source_url
+        if puller is None or current is None or not same_stream_shape(current, url):
+            return False
+        loop = asyncio.get_running_loop()
+        found = await loop.run_in_executor(None, self._continuation, url, referer, puller)
+        # The stream may have been replaced or stopped while the new link was checked.
+        if found is None or self._puller is not puller or self.source_url != current:
+            return False
+        pull_urls, media = found
+        self.source_url = url
+        self.referer = referer
+        if pull_urls:
+            self._pull_urls = pull_urls
+        puller.rebind(media, referer)
+        if self.history is not None:
+            self.history.describe(
+                self._session, source_url=url, source_host=status.source_host(url), referer=referer
+            )
+        _LOGGER.info("the same stream again, from a fresh link; carrying on without a restart")
+        return True
+
+    def _continuation(
+        self, url: str, referer: str, puller: StrippingPuller
+    ) -> tuple[list[str], str] | None:
+        """Return (rendition playlists, the one to pull) if the link continues this stream.
+
+        Judged on the picture itself: the newest segment must carry timestamps near
+        where the relay has got to, which a different channel's clock would not.
+        """
+        expected = puller.expected
+        if expected is None:
+            return None
+        fetcher = Fetcher(self.user_agent, referer=referer)
+        try:
+            body = fetcher.get_plain(url).decode("utf-8", "replace")
+            pull_urls: list[str] = []
+            media = url
+            if variants(body):
+                pull_urls = variant_uris(body, url)
+                if len(pull_urls) != len(self._pull_urls) or not all(pull_urls):
+                    return None
+                at = self._variant if self._variant is not None and len(pull_urls) > 1 else 0
+                media = pull_urls[at]
+            listed = parse(fetcher.get_plain(media).decode("utf-8", "replace"), media)
+            if not listed:
+                return None
+            sample = fetcher.get_plain(listed[-1][0])
+        except Exception as error:
+            _LOGGER.info("could not check the new link against the stream: %s", error)
+            return None
+        begins = first_pts(sample[payload_offset(sample) :])
+        if begins is None:
+            return None
+        step = ((begins - expected + WRAP // 2) % WRAP - WRAP // 2) / TICKS
+        if not -REPEAT_SECONDS <= step <= CARRY_ON_SECONDS:
+            _LOGGER.info("the new link is %+.0fs from the stream's clock: a different one", step)
+            return None
+        return pull_urls, media
 
     async def pause(self) -> None:
         """Stop pulling but remember what was playing, so it can resume."""
@@ -409,6 +511,15 @@ class Channel:
         if not self.playing:
             return {"state": "idle", "because": "nothing is playing"}
         clock = time.monotonic()
+        # The loop's clock is time.monotonic, which the puller times its failures with.
+        if (puller := self._puller) is not None:
+            refused = puller.refused_for(clock)
+            if refused >= REFUSED_SECONDS:
+                return {
+                    "state": "poor",
+                    "because": refusal_advice(puller.failure, refused),
+                    "refused_seconds": round(refused),
+                }
         _, seconds, size = status.window(self.directory)
         bitrate = size * 8 / seconds / 1000 if seconds > 0 else None
         if slow := self.slow_player(clock, bitrate):
@@ -1119,7 +1230,8 @@ class Channel:
         attempt = 0
         while True:
             started = time.monotonic()
-            code = await self._attempt(url)
+            # The latest link: a fresh one may have been carried on to since the start.
+            code = await self._attempt(self.source_url or url)
             ran_for = time.monotonic() - started
 
             if code == 0 and not self._is_hls:
@@ -1154,7 +1266,12 @@ class Channel:
     async def _attempt_stripped(self, url: str) -> int | None:
         """Pass the source's own segments through, with no ffmpeg involved."""
         republisher = Republisher(
-            self.directory, PLAYLIST, self.hls_list_size, start=self._numbering_starts_at()
+            self.directory,
+            PLAYLIST,
+            self.hls_list_size,
+            start=self._numbering_starts_at(),
+            filler=self._card,
+            filler_seconds=standby.SECONDS,
         )
         if self._pull_urls:
             at = self._variant if self._variant is not None and len(self._pull_urls) > 1 else 0

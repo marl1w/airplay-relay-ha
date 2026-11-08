@@ -20,6 +20,10 @@ OPENING_SEGMENTS = 3
 # unless it was asked to hold back more than this.
 PRIME_SECONDS = 20.0
 
+# How long a smoothed feed may run dry before the card fills in: about when players,
+# which start this far back, run out. Until then they still have picture in hand.
+FILL_AFTER_SECONDS = START_SECONDS_BACK
+
 
 class Republisher:
     """Keeps a rolling HLS window on disk from segments handed to it.
@@ -29,8 +33,21 @@ class Republisher:
     players as an even stream, for as long as the reservoir lasts.
     """
 
-    def __init__(self, directory: Path, playlist: str, window: int, start: int = 0) -> None:
-        """Publish into this directory, keeping `window` segments, numbering from `start`."""
+    def __init__(
+        self,
+        directory: Path,
+        playlist: str,
+        window: int,
+        start: int = 0,
+        filler: list[bytes] | None = None,
+        filler_seconds: float = 2.0,
+    ) -> None:
+        """Publish into this directory, keeping `window` segments, numbering from `start`.
+
+        With `filler`, segments of `filler_seconds` each, a feed that runs dry carries
+        them instead of standing still: a player left with a window that no longer
+        moves reopens it and plays the same seconds over and over.
+        """
         self.directory = directory
         self.playlist = playlist
         self.window = window
@@ -48,6 +65,12 @@ class Republisher:
         self._starved = False
         self._waiting_since = 0.0
         self._next_release = 0.0
+        self.filler = filler or []
+        self.filler_seconds = filler_seconds
+        self.filled = 0
+        self._starved_at = 0.0
+        self._filling = False
+        self._next_fill = 0.0
 
     @property
     def reservoir(self) -> float:
@@ -97,6 +120,10 @@ class Republisher:
         else:
             while self._pending and now >= self._next_release:
                 entry = self._pending.pop(0)
+                if self._filling:
+                    # Back from the card: a different picture, so players must reset.
+                    entry = (entry[0], entry[1], True)
+                    self._filling = False
                 self._list(entry)
                 # Late after running dry, the schedule restarts from now.
                 base = now if self._starved else self._next_release
@@ -106,11 +133,34 @@ class Republisher:
             if not self._pending and now >= self._next_release and not self._starved:
                 # Players have been listed everything there is, and are about to run dry.
                 self._starved = True
+                self._starved_at = now
                 self.underruns.append(now)
                 _LOGGER.warning("the reservoir ran dry: no segment arrived in time")
+            if self._fill(now):
+                changed = True
 
         if changed:
             self._write_playlist()
+
+    def _fill(self, now: float) -> bool:
+        """List the next card segment if the feed has been dry long enough. True if listed."""
+        if not (self.filler and self._starved and not self._pending):
+            return False
+        if now - self._starved_at < FILL_AFTER_SECONDS or now < self._next_fill:
+            return False
+        if not self._filling:
+            _LOGGER.warning(
+                "nothing new for %.0fs; showing the card until the source is back",
+                now - self._starved_at,
+            )
+        name = f"seg_{self._written:05d}.ts"
+        (self.directory / name).write_bytes(self.filler[self.filled % len(self.filler)])
+        self._written += 1
+        self._list((name, self.filler_seconds, not self._filling))
+        self._filling = True
+        self.filled += 1
+        self._next_fill = now + self.filler_seconds
+        return True
 
     def widen(self, depth: float) -> None:
         """Hold back `depth` seconds of media, from here on."""
